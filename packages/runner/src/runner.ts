@@ -9,6 +9,7 @@
  *
  * 用法：
  *   PM_URL=http://host:4000 WORKER_ID=home-pc WORKER_LABELS=code,gpu npm run runner
+ *   WORK_DIR=~/code/my-repo ... npm run runner   # 指定 agent 的工作目錄（預設是啟動 runner 時所在的目錄）
  *   npm run runner -- --dry-run     # 不啟動真實 agent，假裝幹幾秒活，用來驗證連通
  *   npm run runner -- --once        # 做完一個任務就退出
  */
@@ -28,6 +29,8 @@ const config = {
   labels: (env.WORKER_LABELS ?? '').split(',').map((s) => s.trim()).filter(Boolean),
   /** 啟動 agent 的命令，任務提示詞會作為最後一個參數傳入 */
   agentCmd: env.AGENT_CMD ?? 'claude -p',
+  /** agent 的工作目錄，通常是這台電腦上的代碼倉庫；預設為啟動 runner 時所在的目錄 */
+  workDir: env.WORK_DIR ?? env.INIT_CWD ?? process.cwd(),
   pollMs: Number(env.POLL_MS ?? 5000),
   dryRun: args.has('--dry-run'),
   once: args.has('--once'),
@@ -71,6 +74,7 @@ function runAgent(task: Task, onChild: (kill: () => void) => void) {
     }
     const [cmd, ...cmdArgs] = config.agentCmd.split(' ').filter(Boolean);
     const child = spawn(cmd, [...cmdArgs, buildPrompt(task)], {
+      cwd: config.workDir,
       stdio: ['ignore', 'pipe', 'pipe'],
       env: { ...env, PM_TASK_ID: task.id, PM_WORKER_ID: config.workerId, PM_URL: config.url },
     });
@@ -130,7 +134,7 @@ async function work(task: Task, leaseMs: number) {
 }
 
 async function main() {
-  log(`連接 ${config.url}，標籤 [${config.labels.join(', ')}]${config.dryRun ? '，dry-run' : ''}`);
+  log(`連接 ${config.url}，標籤 [${config.labels.join(', ')}]${config.dryRun ? '，dry-run' : `，agent 工作目錄 ${config.workDir}`}`);
   let registered = false;
   for (;;) {
     try {

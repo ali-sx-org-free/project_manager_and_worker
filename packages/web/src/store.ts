@@ -71,7 +71,10 @@ export const useStore = create<State>((set, get) => ({
   apply(e) {
     if (e.type === 'heartbeat') {
       if (e.worker_id) fx.heartbeats.set(e.worker_id, performance.now());
-      return; // 心跳只續約，不改變任何可見狀態
+      // 心跳只續約：更新租約到期時間，讓側欄的倒數跳回去
+      const cur = e.task && get().tasks[e.task.id];
+      if (cur && e.task) set({ tasks: { ...get().tasks, [cur.id]: { ...cur, lease_expires_at: e.task.lease_expires_at } } });
+      return;
     }
     const s = get();
     const world: World = { projects: { ...s.projects }, tasks: { ...s.tasks }, workers: { ...s.workers } };

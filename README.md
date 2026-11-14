@@ -9,6 +9,8 @@
 | --- | --- | --- |
 | ![側欄](docs/screenshots/02-review-panel.png) | ![聚焦](docs/screenshots/03-focus-project.png) | ![列表](docs/screenshots/04-list.png) |
 
+**想一步步驗收和上手操作，請看 [docs/TUTORIAL.md](docs/TUTORIAL.md)。**
+
 ## 一分鐘跑起來
 
 需要 Node 20 以上。
@@ -128,6 +130,8 @@ WORKER_LABELS=code,gpu,home-pc \
 npm run runner                 # 預設用 `claude -p "<任務提示詞>"` 執行，可用 AGENT_CMD 換成別的命令
 npm run runner -- --dry-run    # 不啟動真實 agent，假裝幹 6 秒活，用來驗證連通
 ```
+
+用 `WORK_DIR` 指定 agent 的工作目錄（通常是那台電腦上的代碼倉庫），預設是啟動 runner 時所在的目錄。
 
 runner 負責領取和心跳，agent 負責幹活並通過 MCP 調用 `submit_result`。
 agent 退出時如果沒有自己提交，runner 兜底：正常退出就用輸出尾部當 summary 提交，異常退出就回報 `blocked`。

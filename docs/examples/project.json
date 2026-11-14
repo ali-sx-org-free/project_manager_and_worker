@@ -1,0 +1,30 @@
+{
+  "title": "驗收練習：部落格加上留言功能",
+  "kind": "dev",
+  "description": "人類的請求：「幫部落格加上留言功能。」",
+  "tasks": [
+    {
+      "key": "api",
+      "title": "留言 API",
+      "labels": ["code"],
+      "description": "新增留言的建立與列表接口。",
+      "acceptance": "有單元測試；未登入不能留言。"
+    },
+    {
+      "key": "ui",
+      "title": "留言區前端",
+      "labels": ["code"],
+      "deps": ["api"],
+      "description": "文章頁底部顯示留言並可送出。",
+      "acceptance": "送出後不需重新整理即可看到新留言。"
+    },
+    {
+      "key": "notice",
+      "title": "發布公告",
+      "labels": ["docs"],
+      "deps": ["ui"],
+      "description": "寫一段更新說明。",
+      "acceptance": "一百字以內。"
+    }
+  ]
+}
