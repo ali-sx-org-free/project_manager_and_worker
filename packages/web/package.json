@@ -1,0 +1,31 @@
+{
+  "name": "@agent-pm/web",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "3D 視窗：react-three-fiber + dagre",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "build:single": "vite build --mode single",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@agent-pm/core": "*",
+    "@dagrejs/dagre": "^3.1.0",
+    "@react-three/drei": "^10.7.0",
+    "@react-three/fiber": "^9.8.0",
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0",
+    "three": "^0.187.0",
+    "zustand": "^5.0.0"
+  },
+  "devDependencies": {
+    "@types/react": "^19.2.0",
+    "@types/react-dom": "^19.2.0",
+    "@types/three": "^0.187.0",
+    "@vitejs/plugin-react": "^6.0.0",
+    "vite": "^8.3.0",
+    "vite-plugin-singlefile": "^2.3.0"
+  }
+}

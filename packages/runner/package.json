@@ -1,0 +1,16 @@
+{
+  "name": "@agent-pm/runner",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Worker runner：常駐腳本，領任務、啟動本地 agent、發心跳",
+  "scripts": {
+    "start": "tsx src/runner.ts"
+  },
+  "dependencies": {
+    "@agent-pm/core": "*"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0"
+  }
+}

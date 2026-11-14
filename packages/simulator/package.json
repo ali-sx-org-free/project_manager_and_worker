@@ -1,0 +1,16 @@
+{
+  "name": "@agent-pm/simulator",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "假數據模擬器：通過 REST 扮演多台電腦上的 worker 和 PM",
+  "scripts": {
+    "start": "tsx src/index.ts"
+  },
+  "dependencies": {
+    "@agent-pm/core": "*"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0"
+  }
+}

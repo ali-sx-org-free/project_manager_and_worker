@@ -1,0 +1,25 @@
+{
+  "name": "@agent-pm/server",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "協調服務：REST + WebSocket + MCP，SQLite 存儲",
+  "scripts": {
+    "start": "tsx src/index.ts",
+    "test": "tsx --test src/*.test.ts"
+  },
+  "dependencies": {
+    "@agent-pm/core": "*",
+    "@modelcontextprotocol/sdk": "^1.32.0",
+    "better-sqlite3": "^13.1.0",
+    "express": "^5.1.0",
+    "ws": "^8.18.0",
+    "zod": "^3.25.0"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.0",
+    "@types/express": "^5.0.0",
+    "@types/node": "^22.0.0",
+    "@types/ws": "^8.5.0"
+  }
+}

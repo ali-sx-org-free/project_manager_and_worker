@@ -1,0 +1,27 @@
+{
+  "name": "agent-pm",
+  "version": "0.1.0",
+  "private": true,
+  "description": "多 agent 項目管理原型：協調服務 + MCP + Worker runner + 3D 視窗",
+  "type": "module",
+  "workspaces": [
+    "packages/*"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "demo": "npm run build -w @agent-pm/web && node scripts/run.mjs demo",
+    "dev": "node scripts/run.mjs dev",
+    "server": "npm start -w @agent-pm/server",
+    "sim": "npm start -w @agent-pm/simulator",
+    "runner": "npm start -w @agent-pm/runner --",
+    "build": "npm run build -w @agent-pm/web",
+    "test": "npm test -w @agent-pm/core && npm test -w @agent-pm/server",
+    "typecheck": "tsc -p packages/core && tsc -p packages/server && tsc -p packages/simulator && tsc -p packages/runner && tsc -p packages/web"
+  },
+  "devDependencies": {
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0"
+  }
+}

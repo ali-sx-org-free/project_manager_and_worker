@@ -1,0 +1,13 @@
+{
+  "name": "@agent-pm/core",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "任務 DAG 狀態機、Store 介面、模擬器。純 TypeScript，Node 與瀏覽器共用。",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "test": "tsx --test src/*.test.ts"
+  }
+}
