@@ -2,17 +2,21 @@ import type { Request, Response } from 'express';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { z } from 'zod';
-import { PmError, buildResume, type Engine, type Task } from '@agent-pm/core';
+import { PmError, buildResume, scoped, type Engine, type Scoped, type Task, type User } from '@agent-pm/core';
 
 /** 把協調服務暴露成 MCP 工具。Agent 只要配置一行 MCP 地址就能領任務、交付、review。
  *
  *  Worker 用：register_worker / list_ready_tasks / claim_task / heartbeat / save_checkpoint /
  *             submit_result / release_task / report_blocked
- *  PM 用：    create_project / list_tasks / get_task / review_task / unblock_task
+ *  PM 用：    create_project / list_projects / update_project / set_project_member /
+ *             list_tasks / get_task / review_task / unblock_task
+ *
+ *  每個請求都帶著調用者的身分（Bearer token 對應的用戶），權限規則在 core 的 Scoped 裡。
  */
 
 const brief = (t: Task) => ({
   id: t.id,
+  project: t.project_key,
   key: t.key,
   title: t.title,
   state: t.state,
@@ -24,7 +28,7 @@ const brief = (t: Task) => ({
   branch: t.branch,
 });
 
-function buildServer(engine: Engine) {
+function buildServer(engine: Engine, api: Scoped) {
   const server = new McpServer({ name: 'agent-pm', version: '0.1.0' });
 
   const ok = (data: unknown) => ({
@@ -61,18 +65,19 @@ function buildServer(engine: Engine) {
         name: z.string().optional().describe('顯示名稱'),
         machine: z.string().optional().describe('所在電腦，例如「家用電腦」'),
         labels: z.array(z.string()).optional().describe('能力標籤'),
+        projects: z.array(z.string()).optional().describe('只為這些項目（短名）幹活；省略表示你有權參與的項目都可以'),
       },
     },
-    guard(({ worker_id, ...rest }) => engine.registerWorker({ id: worker_id, ...rest })),
+    guard(({ worker_id, ...rest }) => api.registerWorker({ id: worker_id, ...rest })),
   );
 
   server.registerTool(
     'list_ready_tasks',
     {
-      description: '列出這個 worker 目前可以領取的任務（ready 或被退回待修改，且能力標籤符合）。',
+      description: '列出這個 worker 目前可以領取的任務，已按「應該先做哪個」排好：項目優先級高的在前。只包含你有權參與、能力標籤符合、並行配額還沒滿的項目裡的任務。',
       inputSchema: { worker_id: z.string() },
     },
-    guard(({ worker_id }) => engine.listClaimable(worker_id).map(brief)),
+    guard(({ worker_id }) => api.listClaimable(worker_id).map(brief)),
   );
 
   server.registerTool(
@@ -86,10 +91,17 @@ function buildServer(engine: Engine) {
       },
     },
     guard(({ worker_id, task_id }) => {
-      const task = engine.claimTask(worker_id, task_id);
+      const task = api.claimTask(worker_id, task_id);
       return task
         ? {
             task,
+            project: (({ id, key, title, priority }) => ({ id, key, title, priority }))(engine.getProject(task.project_id)),
+            git: {
+              branch: task.branch,
+              commit_prefix: `[${task.project_key}/${task.key}]`,
+              commit_trailers: [`Project: ${task.project_key}`, `Task: ${task.id}`],
+              note: '所有項目共用一個倉庫。只在 branch 這個分支上提交；每個 commit 的標題以 commit_prefix 開頭，結尾附上 commit_trailers 這兩行，這樣才能在倉庫裡分清是哪個項目的改動。',
+            },
             resume: buildResume(task),
             lease_ms: engine.leaseMs,
             heartbeat_every_ms: Math.floor(engine.leaseMs / 3),
@@ -104,7 +116,7 @@ function buildServer(engine: Engine) {
       description: '續約。執行任務期間每隔 lease 的三分之一調用一次。如果返回 lease_lost，表示任務已被收回，請立即停止。',
       inputSchema: { worker_id: z.string(), task_id: z.string() },
     },
-    guard(({ worker_id, task_id }) => engine.heartbeat(worker_id, task_id)),
+    guard(({ worker_id, task_id }) => api.heartbeat(worker_id, task_id)),
   );
 
   server.registerTool(
@@ -122,7 +134,7 @@ function buildServer(engine: Engine) {
         artifacts: z.array(z.string()).optional().describe('其他中間產物的鏈接或路徑'),
       },
     },
-    guard(({ worker_id, task_id, ...cp }) => engine.saveCheckpoint(worker_id, task_id, cp)),
+    guard(({ worker_id, task_id, ...cp }) => api.saveCheckpoint(worker_id, task_id, cp)),
   );
 
   server.registerTool(
@@ -137,7 +149,7 @@ function buildServer(engine: Engine) {
         note: z.string().optional().describe('給接手者的交接說明'),
       },
     },
-    guard(({ worker_id, task_id, reason, note }) => brief(engine.releaseTask(worker_id, task_id, { reason, note }))),
+    guard(({ worker_id, task_id, reason, note }) => brief(api.releaseTask(worker_id, task_id, { reason, note }))),
   );
 
   server.registerTool(
@@ -153,7 +165,7 @@ function buildServer(engine: Engine) {
       },
     },
     guard(({ worker_id, task_id, summary, pr_url }) =>
-      brief(engine.submitResult(worker_id, task_id, { summary, pr_url })),
+      brief(api.submitResult(worker_id, task_id, { summary, pr_url })),
     ),
   );
 
@@ -163,7 +175,7 @@ function buildServer(engine: Engine) {
       description: '任務無法繼續時回報受阻（例如缺少權限、需要人類決定）。任務進入 blocked，等 PM 或人類解除。',
       inputSchema: { worker_id: z.string(), task_id: z.string(), reason: z.string() },
     },
-    guard(({ worker_id, task_id, reason }) => brief(engine.reportBlocked(worker_id, task_id, reason))),
+    guard(({ worker_id, task_id, reason }) => brief(api.reportBlocked(worker_id, task_id, reason))),
   );
 
   // ───────── PM 工具 ─────────
@@ -175,6 +187,16 @@ function buildServer(engine: Engine) {
         'PM 專用：把人類的請求拆解成任務 DAG 並建立項目。每個任務用 key 互相引用依賴，服務端會校驗無環。沒有依賴的任務立即變成 ready。',
       inputSchema: {
         title: z.string(),
+        key: z
+          .string()
+          .optional()
+          .describe('項目短名，小寫字母、數字、連字號，例如 site。所有項目共用一個倉庫，分支名 project/<短名>/… 和 commit 標記都用它'),
+        priority: z.number().int().min(1).max(5).optional().describe('優先級 1 到 5，越大越優先，預設 3'),
+        max_parallel: z.number().int().min(0).nullable().optional().describe('並行配額：同時最多幾個任務在執行；省略或 null 不限'),
+        members: z
+          .array(z.object({ user_id: z.string(), role: z.enum(['manager', 'contributor', 'viewer']) }))
+          .optional()
+          .describe('項目成員。不是成員的人看不到這個項目'),
         description: z.string().optional(),
         kind: z.enum(['dev', 'chore']).optional().describe('dev=研發項目，chore=日常雜事'),
         tasks: z
@@ -192,9 +214,66 @@ function buildServer(engine: Engine) {
       },
     },
     guard((input) => {
-      const { project, tasks } = engine.createProject(input);
+      const { project, tasks } = api.createProject(input);
       return { project, tasks: tasks.map(brief) };
     }),
+  );
+
+  server.registerTool(
+    'list_projects',
+    {
+      description:
+        '列出你看得到的項目：短名、優先級、並行配額、現在有幾個任務在執行、各狀態的任務數、成員、你在裡面的角色。PM 用它決定資源怎麼分。',
+      inputSchema: {},
+    },
+    guard(() => {
+      const snap = api.snapshot();
+      return snap.projects.map((p) => {
+        const tasks = snap.tasks.filter((t) => t.project_id === p.id);
+        const count: Record<string, number> = {};
+        for (const t of tasks) count[t.state] = (count[t.state] ?? 0) + 1;
+        return {
+          id: p.id,
+          key: p.key,
+          title: p.title,
+          status: p.status,
+          priority: p.priority,
+          max_parallel: p.max_parallel,
+          running: count.claimed ?? 0,
+          tasks: count,
+          my_role: engine.roleOf(api.actor, p.id),
+          members: snap.members.filter((m) => m.project_id === p.id).map((m) => ({ user_id: m.user_id, role: m.role })),
+        };
+      });
+    }),
+  );
+
+  server.registerTool(
+    'update_project',
+    {
+      description:
+        'PM 專用：調整項目的優先級和並行配額，立刻生效。優先級決定 worker 先領哪個項目的任務；並行配額限制一個項目同時佔用幾個 worker，設成 0 等於暫停派工（正在做的不會被打斷）。',
+      inputSchema: {
+        project: z.string().describe('項目 id 或短名'),
+        priority: z.number().int().min(1).max(5).optional(),
+        max_parallel: z.number().int().min(0).nullable().optional().describe('null 表示不限'),
+      },
+    },
+    guard(({ project, priority, max_parallel }) => api.updateProject(project, { priority, max_parallel })),
+  );
+
+  server.registerTool(
+    'set_project_member',
+    {
+      description:
+        'PM 專用：設定項目成員的角色，role 傳 null 則移出。manager 可以 review 和改設定，contributor 的 worker 可以領這個項目的任務，viewer 只能看。不是成員的人看不到這個項目。',
+      inputSchema: {
+        project: z.string().describe('項目 id 或短名'),
+        user_id: z.string(),
+        role: z.enum(['manager', 'contributor', 'viewer']).nullable(),
+      },
+    },
+    guard(({ project, user_id, role }) => api.setMember(project, user_id, role)),
   );
 
   server.registerTool(
@@ -209,7 +288,7 @@ function buildServer(engine: Engine) {
       },
     },
     guard(({ project_id, state }) => {
-      const snap = engine.snapshot();
+      const snap = api.snapshot();
       return {
         projects: snap.projects,
         tasks: snap.tasks
@@ -225,7 +304,7 @@ function buildServer(engine: Engine) {
       description: '查看任務完整內容：描述、驗收標準、交付結果、PR 鏈接、review 歷史。',
       inputSchema: { task_id: z.string() },
     },
-    guard(({ task_id }) => engine.getTask(task_id)),
+    guard(({ task_id }) => api.getTask(task_id)),
   );
 
   server.registerTool(
@@ -241,7 +320,7 @@ function buildServer(engine: Engine) {
       },
     },
     guard(({ task_id, decision, comment, reviewer }) =>
-      brief(engine.review(task_id, { decision, comment, reviewer: reviewer ?? 'PM' })),
+      brief(api.review(task_id, { decision, comment, reviewer: reviewer ?? 'PM' })),
     ),
   );
 
@@ -251,16 +330,16 @@ function buildServer(engine: Engine) {
       description: 'PM 專用：阻塞原因解決後，把 blocked 的任務放回任務池。',
       inputSchema: { task_id: z.string(), by: z.string().optional() },
     },
-    guard(({ task_id, by }) => brief(engine.unblock(task_id, by ?? 'PM'))),
+    guard(({ task_id, by }) => brief(api.unblock(task_id, by ?? 'PM'))),
   );
 
   return server;
 }
 
 /** 無狀態 Streamable HTTP：每個請求建一個 server + transport，不需要會話保持，方便放在反向代理後面。 */
-export function mcpHandler(engine: Engine) {
+export function mcpHandler(engine: Engine, actorOf: (req: Request) => User) {
   return async (req: Request, res: Response) => {
-    const server = buildServer(engine);
+    const server = buildServer(engine, scoped(engine, actorOf(req)));
     const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
     try {
       await server.connect(transport);

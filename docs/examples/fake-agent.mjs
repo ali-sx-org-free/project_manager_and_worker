@@ -11,7 +11,9 @@
  *   FAKE_STEP_MS=2000     每章耗時
  *   FAKE_FAIL_AT=3        寫完第 3 章後假裝額度用完（輸出 usage limit 並以非 0 退出）
  *   FAKE_NO_CHECKPOINT=1  不自己存檢查點（模擬不會調用 save_checkpoint 的 agent，只靠 runner 的自動檢查點）
+ *   FAKE_COMMIT=1         每寫完一章自己 git commit 一次（訊息故意不帶項目標記，用來驗證 runner 裝的 git hook 會補上）
  */
+import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 
@@ -32,11 +34,19 @@ for (let n = done + 1; n <= CHAPTERS; n++) {
   await new Promise((r) => setTimeout(r, stepMs));
   fs.appendFileSync(file, `## 第 ${n} 章\n\n由 ${worker} 完成。\n\n`);
   console.log(`寫完第 ${n}/${CHAPTERS} 章`);
+  if (process.env.FAKE_COMMIT) {
+    const git = (...a) => execFileSync('git', a, { stdio: ['ignore', 'pipe', 'pipe'] });
+    git('add', '-A');
+    git('-c', `user.name=${worker}`, '-c', `user.email=${worker}@agent-pm.local`, 'commit', '-q', '-m', `寫完第 ${n} 章`);
+  }
   // 相當於真實 agent 調用 MCP 的 save_checkpoint
   if (process.env.PM_TASK_ID && n < CHAPTERS && !process.env.FAKE_NO_CHECKPOINT) {
     await fetch(api, {
       method: 'POST',
-      headers: { 'content-type': 'application/json' },
+      headers: {
+        'content-type': 'application/json',
+        ...(process.env.PM_TOKEN ? { authorization: `Bearer ${process.env.PM_TOKEN}` } : {}),
+      },
       body: JSON.stringify({
         worker_id: worker,
         summary: `寫完第 ${n}/${CHAPTERS} 章`,

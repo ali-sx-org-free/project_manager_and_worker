@@ -1,6 +1,6 @@
 import { useMemo } from 'react';
 import { create } from 'zustand';
-import type { PmEvent, Project, Snapshot, Task, Worker } from '@agent-pm/core';
+import type { Me, Member, PmEvent, Project, ProjectRole, Snapshot, Task, User, Worker } from '@agent-pm/core';
 
 /** 只給動畫用的瞬時狀態，放在 React 之外，由 useFrame 每幀讀取 */
 export const fx = {
@@ -10,7 +10,7 @@ export const fx = {
   heartbeats: new Map<string, number>(),
 };
 
-export type Mode = 'connecting' | 'live' | 'demo';
+export type Mode = 'connecting' | 'live' | 'demo' | 'denied';
 
 export interface World {
   projects: Record<string, Project>;
@@ -20,6 +20,12 @@ export interface World {
 
 interface State extends World {
   mode: Mode;
+  /** 我是誰（或正以誰的視角檢視）。看得到哪些項目、能不能 review 都由它決定 */
+  me: Me | null;
+  users: Record<string, User>;
+  /** 完整的用戶名單（以自己的身分看到的），給「檢視身分」選單用；換成別人的視角後 users 會被過濾，這份不變 */
+  roster: User[];
+  members: Member[];
   events: PmEvent[];
   selected: string | null;
   view: '3d' | 'list';
@@ -48,6 +54,10 @@ const MAX_EVENTS = 3000;
 
 export const useStore = create<State>((set, get) => ({
   mode: 'connecting',
+  me: null,
+  users: {},
+  roster: [],
+  members: [],
   projects: {},
   tasks: {},
   workers: {},
@@ -63,8 +73,12 @@ export const useStore = create<State>((set, get) => ({
       projects: by(snapshot.projects),
       tasks: by(snapshot.tasks),
       workers: by(snapshot.workers),
+      users: by(snapshot.users ?? []),
+      members: snapshot.members ?? [],
       events: events.filter((e) => e.id > 0),
       replayIdx: null,
+      focus: get().focus !== 'all' && !snapshot.projects.some((p) => p.id === get().focus) ? 'all' : get().focus,
+      selected: get().selected && snapshot.tasks.some((t) => t.id === get().selected) ? get().selected : null,
     });
   },
 
@@ -98,7 +112,10 @@ export const useStore = create<State>((set, get) => ({
       }
     }
     const focus = s.focus !== 'all' && !world.projects[s.focus] ? 'all' : s.focus;
-    set({ ...world, events, replayIdx, focus });
+    // 成員變更：整組替換這個項目的成員
+    const members =
+      e.members && e.project_id ? [...s.members.filter((m) => m.project_id !== e.project_id), ...e.members] : s.members;
+    set({ ...world, events, replayIdx, focus, members });
   },
 
   set: (patch) => set(patch),
@@ -123,5 +140,17 @@ export function useWorld(): World {
   }, [projects, tasks, workers, events, replayIdx]);
 }
 
+/** 優先級高的排前面（3D 裡就是最靠近鏡頭的檯面），同優先級按建立時間 */
 export const sortedProjects = (w: World) =>
-  Object.values(w.projects).sort((a, b) => a.created_at - b.created_at || a.id.localeCompare(b.id));
+  Object.values(w.projects).sort(
+    (a, b) => b.priority - a.priority || a.created_at - b.created_at || a.id.localeCompare(b.id),
+  );
+
+/** 我在這個項目裡的角色。管理員一律是負責人 */
+export function useRole(projectId: string | undefined): ProjectRole | null {
+  const me = useStore((s) => s.me);
+  const members = useStore((s) => s.members);
+  if (!projectId) return null;
+  if (!me || me.user.admin) return 'manager';
+  return members.find((m) => m.project_id === projectId && m.user_id === me.user.id)?.role ?? null;
+}

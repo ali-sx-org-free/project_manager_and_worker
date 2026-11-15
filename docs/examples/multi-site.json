@@ -1,0 +1,19 @@
+{
+  "title": "官網改版",
+  "key": "site",
+  "priority": 4,
+  "max_parallel": 1,
+  "description": "多項目練習：優先級高，但同時只給一個 worker。",
+  "tasks": [
+    {
+      "key": "api",
+      "title": "官網：寫 API 文件",
+      "acceptance": "五章齊全。"
+    },
+    {
+      "key": "ui",
+      "title": "官網：寫介面文件",
+      "acceptance": "五章齊全。"
+    }
+  ]
+}

@@ -30,8 +30,34 @@ export const TASK_STATES: TaskState[] = [
 export type ProjectKind = 'dev' | 'chore';
 export type ProjectStatus = 'active' | 'delivered' | 'archived';
 
+/** 項目內的角色：manager 可以改設定、管成員、review；contributor 的 worker 可以領任務；viewer 只能看 */
+export type ProjectRole = 'manager' | 'contributor' | 'viewer';
+export const ROLE_LABEL: Record<ProjectRole, string> = { manager: '負責人', contributor: '參與者', viewer: '觀察者' };
+
+/** 一個人（或一個 PM agent）的身分。admin 能看到並管理所有項目。 */
+export interface User {
+  id: string;
+  name: string;
+  admin: boolean;
+  created_at: number;
+}
+
+export interface Member {
+  project_id: string;
+  user_id: string;
+  role: ProjectRole;
+}
+
+export const PRIORITY_LABEL: Record<number, string> = { 1: '最低', 2: '低', 3: '普通', 4: '高', 5: '緊急' };
+
 export interface Project {
   id: string;
+  /** 項目短名，只含小寫字母、數字和連字號。所有項目共用一個倉庫，分支名和 commit 靠它區分項目 */
+  key: string;
+  /** 1 到 5，越大越優先。worker 有多個項目的任務可領時，先領優先級高的 */
+  priority: number;
+  /** 並行配額：這個項目同時最多有幾個任務在執行。null 不限，0 等於暫停派工 */
+  max_parallel: number | null;
   title: string;
   description: string;
   kind: ProjectKind;
@@ -109,6 +135,8 @@ export interface ResumeContext {
 export interface Task {
   id: string;
   project_id: string;
+  /** 所屬項目的短名（冗餘一份，方便 worker 和 agent 直接看到） */
+  project_key: string;
   /** 項目內的短名，拆解時用來互相引用依賴 */
   key: string;
   title: string;
@@ -132,7 +160,7 @@ export interface Task {
   worklog: WorkLogEntry[];
   /** 最近一個檢查點回報的進度，0 到 100 */
   progress: number;
-  /** 這個任務專用的 git 分支。中間成果推到這裡，換人也是同一個分支 */
+  /** 這個任務專用的 git 分支，格式 project/<項目短名>/<任務 key>-<編號>。中間成果推到這裡，換人也是同一個分支 */
   branch: string;
   created_at: number;
   updated_at: number;
@@ -144,7 +172,13 @@ export interface Worker {
   /** 所在電腦，例如「家用電腦」 */
   machine: string;
   labels: string[];
+  /** 這個 worker 屬於誰。它只能領「主人有權參與」的項目的任務；null 表示不設限（未啟用鑒權時） */
+  owner: string | null;
+  /** 可選：只為這些項目（短名）幹活。null 表示主人能參與的都可以 */
+  projects: string[] | null;
   status: 'online' | 'offline';
+  /** 只出現在按身分過濾後的視圖裡：worker 正忙於一個你看不到的項目 */
+  busy_elsewhere?: boolean;
   current_task: string | null;
   last_seen: number;
   registered_at: number;
@@ -154,6 +188,9 @@ export type EventType =
   | 'project_created'
   | 'project_delivered'
   | 'project_archived'
+  | 'project_updated'
+  | 'member_changed'
+  | 'worker_updated'
   | 'task_ready'
   | 'task_claimed'
   | 'task_resumed'
@@ -184,6 +221,8 @@ export interface PmEvent {
   task?: Task;
   tasks?: Task[];
   worker?: Worker;
+  /** member_changed / project_created：這個項目變更後的全部成員 */
+  members?: Member[];
 }
 
 export interface TaskInput {
@@ -197,6 +236,11 @@ export interface TaskInput {
 }
 
 export interface ProjectInput {
+  /** 項目短名，不給就自動生成 */
+  key?: string;
+  priority?: number;
+  max_parallel?: number | null;
+  members?: { user_id: string; role: ProjectRole }[];
   title: string;
   description?: string;
   kind?: ProjectKind;
@@ -208,6 +252,27 @@ export interface WorkerInput {
   name?: string;
   machine?: string;
   labels?: string[];
+  owner?: string | null;
+  projects?: string[] | null;
+}
+
+export interface ProjectPatch {
+  priority?: number;
+  max_parallel?: number | null;
+}
+
+export interface UserInput {
+  id?: string;
+  name: string;
+  admin?: boolean;
+}
+
+/** 「我是誰」：auth 為 false 表示服務沒有啟用鑒權，所有人都是管理員 */
+export interface Me {
+  user: User;
+  auth: boolean;
+  /** 管理員（或未啟用鑒權時）以別人的身分檢視時，這是原本的身分 */
+  acting_for?: User;
 }
 
 export interface Snapshot {
@@ -216,12 +281,14 @@ export interface Snapshot {
   projects: Project[];
   tasks: Task[];
   workers: Worker[];
+  users: User[];
+  members: Member[];
   last_event_id: number;
 }
 
 export class PmError extends Error {
   constructor(
-    public code: 'not_found' | 'conflict' | 'invalid' | 'lease_lost' | 'forbidden',
+    public code: 'not_found' | 'conflict' | 'invalid' | 'lease_lost' | 'forbidden' | 'unauthorized',
     message: string,
   ) {
     super(message);

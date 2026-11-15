@@ -21,6 +21,7 @@
  *   npm run runner -- --once        # 做完（或交出）一個任務就退出
  */
 import { execFileSync, spawn, type ChildProcess } from 'node:child_process';
+import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -39,6 +40,8 @@ const config = {
   name: env.WORKER_NAME ?? env.WORKER_ID ?? os.hostname(),
   machine: env.WORKER_MACHINE ?? os.hostname(),
   labels: (env.WORKER_LABELS ?? '').split(',').map((s) => s.trim()).filter(Boolean),
+  /** 只為這些項目（短名）幹活；不設就是「這個 token 的主人有權參與的項目都做」 */
+  projects: env.WORKER_PROJECTS ? env.WORKER_PROJECTS.split(',').map((s) => s.trim()).filter(Boolean) : null,
   /** 啟動 agent 的命令，任務提示詞會作為最後一個參數傳入 */
   agentCmd: args.has('--fake-agent') ? `node ${fakeAgent}` : (env.AGENT_CMD ?? 'claude -p'),
   /** agent 的工作目錄，通常是這台電腦上的代碼倉庫；預設為啟動 runner 時所在的目錄 */
@@ -97,6 +100,41 @@ function gitPrepare(branch: string) {
   log(`已從 ${base} 建立任務分支 ${branch}`);
 }
 
+const HOOK_MARK = '# agent-pm-hook';
+const HOOK = `#!/bin/sh
+${HOOK_MARK} v1：所有項目共用一個倉庫。agent 在任務裡自己 commit 時，自動補上項目和任務標記，
+# 這樣 git log --grep='Project: <項目短名>' 就能篩出一個項目的全部提交。不在任務裡（沒有 PM_ 環境變量）時什麼都不做。
+[ -n "$PM_PROJECT_KEY" ] && [ -n "$PM_TASK_ID" ] || exit 0
+f="$1"
+grep -q "^Project: " "$f" && exit 0
+first=$(head -n 1 "$f")
+case "$first" in
+  ""|"["*|"#"*) ;;
+  *) { printf '[%s/%s] %s\n' "$PM_PROJECT_KEY" "$PM_TASK_KEY" "$first"; tail -n +2 "$f"; } > "$f.agentpm" && mv "$f.agentpm" "$f" ;;
+esac
+printf '\nProject: %s\nTask: %s\nWorker: %s\n' "$PM_PROJECT_KEY" "$PM_TASK_ID" "$PM_WORKER_ID" >> "$f"
+`;
+
+/** 在工作目錄裝一個 prepare-commit-msg hook，讓 agent 自己的 commit 也帶上項目標記。
+ *  已經有別的 hook 就不動它，只提醒一聲。 */
+function gitInstallHook() {
+  try {
+    const file = path.resolve(config.workDir, git('rev-parse', '--git-path', 'hooks/prepare-commit-msg'));
+    if (fs.existsSync(file)) {
+      const cur = fs.readFileSync(file, 'utf8');
+      if (cur === HOOK) return;
+      if (!cur.includes(HOOK_MARK)) {
+        log(`${file} 已有別的 hook，沒有覆蓋；agent 自己的 commit 不會自動帶項目標記`);
+        return;
+      }
+    }
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, HOOK, { mode: 0o755 });
+  } catch (err) {
+    log(`裝 git hook 失敗：${err instanceof Error ? err.message.slice(0, 200) : err}`);
+  }
+}
+
 /** 把目前的改動 commit 並 push 到任務分支，返回 commit。沒有改動時返回目前的 HEAD。 */
 function gitCheckpoint(task: Task, label: string): string {
   git('add', '-A');
@@ -104,7 +142,9 @@ function gitCheckpoint(task: Task, label: string): string {
     const ident = gitOk('config', 'user.name')
       ? []
       : ['-c', `user.name=${config.name}`, '-c', `user.email=${config.workerId}@agent-pm.local`];
-    git(...ident, 'commit', '-q', '-m', `wip(${task.key}): ${label} [${config.workerId}]`);
+    // 標題帶 [項目/任務]，結尾三行標記：共用倉庫裡靠它們分清每個 commit 是哪個項目、哪個任務、誰做的
+    const message = `[${task.project_key}/${task.key}] ${label}\n\nProject: ${task.project_key}\nTask: ${task.id}\nWorker: ${config.workerId}`;
+    git(...ident, 'commit', '-q', '-m', message);
   }
   git('push', '-q', '-u', 'origin', `HEAD:${task.branch}`);
   return git('rev-parse', '--short', 'HEAD');
@@ -120,6 +160,7 @@ function buildPrompt(task: Task, resume: ResumeContext | null): string {
   const lines = [
     `你是 Worker Agent「${config.name}」（worker_id: ${config.workerId}），已經為你領取了下面這個任務。`,
     ``,
+    `項目：${task.project_key}`,
     `任務 id：${task.id}`,
     `標題：${task.title}`,
     `描述：${task.description || '（無）'}`,
@@ -145,6 +186,8 @@ function buildPrompt(task: Task, resume: ResumeContext | null): string {
     ``,
     `執行過程中，每完成一個有意義的小步驟，就調用 agent-pm 的 MCP 工具 save_checkpoint（worker_id、task_id、summary、next_steps、progress）。`,
     `你隨時可能被中斷，接手的 agent 只能看到檢查點，所以要寫到別人照著就能接著做的程度。`,
+    `所有項目共用這一個倉庫。只在分支 ${task.branch} 上提交，不要切到別的分支，也不要改動其他項目的分支。`,
+    `commit 標題以 [${task.project_key}/${task.key}] 開頭；開 PR 時標題也以它開頭。`,
     `全部完成後調用 submit_result（worker_id、task_id、summary；代碼改動請開 PR 並填 pr_url）。`,
     `如果任務本身無法繼續，調用 report_blocked 並說明原因。心跳由 runner 負責，你不需要調用 heartbeat。`,
   );
@@ -203,6 +246,7 @@ function runAgent(task: Task, resume: ResumeContext | null): Run {
         PM_WORKER_ID: config.workerId,
         PM_TASK_ID: task.id,
         PM_TASK_KEY: task.key,
+        PM_PROJECT_KEY: task.project_key,
         PM_TASK_BRANCH: task.branch,
         PM_RESUME_PROGRESS: String(resume?.progress ?? 0),
       },
@@ -228,13 +272,14 @@ async function work(task: Task, leaseMs: number): Promise<'done' | 'handed_off' 
   const resume = buildResume(task);
   log(
     resume
-      ? `${resume.from_worker === config.workerId ? '回來繼續' : '接手'}「${task.title}」（第 ${task.attempt} 次領取），從 ${resume.progress}% 繼續。上一位：${resume.from_worker === config.workerId ? '自己' : resume.from_worker}${resume.reason ? `，${INTERRUPT_LABEL[resume.reason]}` : ''}`
-      : `領取「${task.title}」（第 ${task.attempt} 次領取），從頭開始`,
+      ? `${resume.from_worker === config.workerId ? '回來繼續' : '接手'} [${task.project_key}]「${task.title}」（第 ${task.attempt} 次領取），從 ${resume.progress}% 繼續。上一位：${resume.from_worker === config.workerId ? '自己' : resume.from_worker}${resume.reason ? `，${INTERRUPT_LABEL[resume.reason]}` : ''}`
+      : `領取 [${task.project_key}]「${task.title}」（第 ${task.attempt} 次領取），從頭開始`,
   );
 
   if (config.gitSync && !config.dryRun) {
     try {
       gitPrepare(task.branch);
+      gitInstallHook();
     } catch (err) {
       await api.releaseTask(config.workerId, task.id, {
         reason: 'error',
@@ -343,18 +388,21 @@ async function work(task: Task, leaseMs: number): Promise<'done' | 'handed_off' 
 
 async function main() {
   log(
-    `連接 ${config.url}，標籤 [${config.labels.join(', ')}]` +
+    `連接 ${config.url}，標籤 [${config.labels.join(', ')}]${config.projects ? `，只做項目 [${config.projects.join(', ')}]` : ''}` +
       (config.dryRun ? '，dry-run' : `，agent 工作目錄 ${config.workDir}${config.gitSync ? '，git 同步已開啟' : ''}`),
   );
   let registered = false;
   while (!interrupted) {
     try {
       if (!registered) {
+        const me = await api.me();
+        if (me.auth) log(`身分：${me.user.name}（${me.user.admin ? '管理員' : '只會領到自己參與的項目的任務'}）`);
         await api.registerWorker({
           id: config.workerId,
           name: config.name,
           machine: config.machine,
           labels: config.labels,
+          projects: config.projects,
         });
         registered = true;
       }

@@ -3,6 +3,7 @@ import { Canvas, useFrame, useThree } from '@react-three/fiber';
 import { useEffect, useMemo, useRef } from 'react';
 import * as THREE from 'three';
 import type { OrbitControls as OrbitControlsImpl } from 'three-stdlib';
+import { PRIORITY_LABEL } from '@agent-pm/core';
 import { computeLayout, dockZ, pmPosition, type Bounds, type Lane, type Vec3 } from '../layout.ts';
 import { sortedProjects, useStore, useWorld } from '../store.ts';
 import { PM_COLOR, WORKER_COLORS } from '../theme.ts';
@@ -95,7 +96,7 @@ function CameraRig({ bounds }: { bounds: Bounds }) {
 }
 
 /** 泳道：每個項目一塊半透明檯面，左前角標出項目名。 */
-function LanePlate({ lane, dim }: { lane: Lane; dim: boolean }) {
+function LanePlate({ lane, dim, running }: { lane: Lane; dim: boolean; running: number }) {
   const { minX, maxX, minZ, maxZ } = lane.bounds;
   const w = maxX - minX;
   const d = maxZ - minZ;
@@ -123,9 +124,20 @@ function LanePlate({ lane, dim }: { lane: Lane; dim: boolean }) {
         lines={[
           { text: lane.project.title, size: 16, weight: 700 },
           {
-            text: delivered ? 'PM 已交付' : lane.project.kind === 'dev' ? '研發項目' : '日常雜事',
+            // 優先級和並行配額：這個項目排第幾、現在佔了幾個 worker、最多能佔幾個
+            text: delivered
+              ? 'PM 已交付'
+              : `${lane.project.key} · 優先 ${PRIORITY_LABEL[lane.project.priority] ?? lane.project.priority} · ${
+                  lane.project.max_parallel === 0
+                    ? '已暫停'
+                    : `並行 ${running}${lane.project.max_parallel === null ? '' : `/${lane.project.max_parallel}`}`
+                }`,
             size: 12,
-            color: delivered ? PM_COLOR : '#8fa0c4',
+            color: delivered
+              ? PM_COLOR
+              : lane.project.max_parallel !== null && running >= lane.project.max_parallel
+                ? '#f7c948'
+                : '#8fa0c4',
           },
         ]}
       />
@@ -168,7 +180,12 @@ function World() {
     <>
       <CameraRig bounds={bounds} />
       {layout.lanes.map((lane) => (
-        <LanePlate key={lane.project.id} lane={lane} dim={focus !== 'all' && focus !== lane.project.id} />
+        <LanePlate
+          key={lane.project.id}
+          lane={lane}
+          dim={focus !== 'all' && focus !== lane.project.id}
+          running={Object.values(world.tasks).filter((t) => t.project_id === lane.project.id && t.state === 'claimed').length}
+        />
       ))}
       <Edges tasks={world.tasks} pos={layout.pos} />
       {Object.values(world.tasks).map(

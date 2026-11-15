@@ -18,6 +18,8 @@ export const PM_COLOR = '#ffd98a';
 export const EVENT_COLOR: Partial<Record<EventType, string>> = {
   project_created: PM_COLOR,
   project_delivered: PM_COLOR,
+  project_updated: PM_COLOR,
+  member_changed: PM_COLOR,
   task_ready: STATE_META.ready.color,
   task_claimed: STATE_META.claimed.color,
   task_resumed: '#ffffff',

@@ -1,11 +1,14 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import Database from 'better-sqlite3';
-import type { PmEvent, Project, Store, Task, TaskState, Worker } from '@agent-pm/core';
+import type { Member, PmEvent, Project, Store, Task, TaskState, User, Worker } from '@agent-pm/core';
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS projects (
   id           TEXT PRIMARY KEY,
+  key          TEXT NOT NULL DEFAULT '',     -- 項目短名：共用倉庫裡靠它區分項目
+  priority     INTEGER NOT NULL DEFAULT 3,   -- 1 到 5，越大越優先
+  max_parallel INTEGER,                      -- 並行配額，NULL 不限
   title        TEXT NOT NULL,
   description  TEXT NOT NULL DEFAULT '',
   kind         TEXT NOT NULL DEFAULT 'dev',
@@ -17,6 +20,7 @@ CREATE TABLE IF NOT EXISTS projects (
 CREATE TABLE IF NOT EXISTS tasks (
   id               TEXT PRIMARY KEY,
   project_id       TEXT NOT NULL REFERENCES projects(id),
+  project_key      TEXT NOT NULL DEFAULT '',
   key              TEXT NOT NULL,
   title            TEXT NOT NULL,
   description      TEXT NOT NULL DEFAULT '',
@@ -51,10 +55,28 @@ CREATE TABLE IF NOT EXISTS workers (
   name          TEXT NOT NULL,
   machine       TEXT NOT NULL DEFAULT '',
   labels        TEXT NOT NULL DEFAULT '[]',
+  owner         TEXT,                         -- 所屬用戶；決定它能領哪些項目的任務
+  projects      TEXT,                         -- JSON 陣列：只為這些項目幹活，NULL 不限
   status        TEXT NOT NULL,
   current_task  TEXT,
   last_seen     INTEGER NOT NULL,
   registered_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS users (
+  id         TEXT PRIMARY KEY,
+  name       TEXT NOT NULL,
+  admin      INTEGER NOT NULL DEFAULT 0,
+  token_hash TEXT UNIQUE,                     -- 只存 token 的 SHA-256
+  created_at INTEGER NOT NULL
+);
+
+-- 誰能看到、能操作哪個項目
+CREATE TABLE IF NOT EXISTS project_members (
+  project_id TEXT NOT NULL REFERENCES projects(id),
+  user_id    TEXT NOT NULL REFERENCES users(id),
+  role       TEXT NOT NULL,                   -- manager / contributor / viewer
+  PRIMARY KEY (project_id, user_id)
 );
 
 CREATE TABLE IF NOT EXISTS events (
@@ -71,9 +93,10 @@ type TaskRow = Omit<Task, 'labels' | 'deps' | 'result' | 'reviews' | 'worklog'> 
   reviews: string;
   worklog: string;
 };
-type WorkerRow = Omit<Worker, 'labels'> & { labels: string };
+type WorkerRow = Omit<Worker, 'labels' | 'projects'> & { labels: string; projects: string | null };
+type UserRow = Omit<User, 'admin'> & { admin: number };
 
-const TASK_COLS = `project_id=@project_id, key=@key, title=@title, description=@description,
+const TASK_COLS = `project_id=@project_id, project_key=@project_key, key=@key, title=@title, description=@description,
   acceptance=@acceptance, labels=@labels, state=@state, assignee=@assignee, last_assignee=@last_assignee,
   lease_expires_at=@lease_expires_at, attempt=@attempt, result=@result, reviews=@reviews,
   blocked_reason=@blocked_reason, worklog=@worklog, progress=@progress, branch=@branch,
@@ -94,13 +117,24 @@ export class SqliteStore implements Store {
 
   /** 舊版本建的資料庫補上後來新增的欄位 */
   private migrate() {
-    const have = new Set((this.db.prepare(`PRAGMA table_info(tasks)`).all() as { name: string }[]).map((c) => c.name));
-    const add = (name: string, ddl: string) => {
-      if (!have.has(name)) this.db.exec(`ALTER TABLE tasks ADD COLUMN ${name} ${ddl}`);
+    const add = (table: string, name: string, ddl: string) => {
+      const have = (this.db.prepare(`PRAGMA table_info(${table})`).all() as { name: string }[]).some((c) => c.name === name);
+      if (!have) this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${name} ${ddl}`);
+      return !have;
     };
-    add('worklog', `TEXT NOT NULL DEFAULT '[]'`);
-    add('progress', `INTEGER NOT NULL DEFAULT 0`);
-    add('branch', `TEXT NOT NULL DEFAULT ''`);
+    add('tasks', 'worklog', `TEXT NOT NULL DEFAULT '[]'`);
+    add('tasks', 'progress', `INTEGER NOT NULL DEFAULT 0`);
+    add('tasks', 'branch', `TEXT NOT NULL DEFAULT ''`);
+    add('tasks', 'project_key', `TEXT NOT NULL DEFAULT ''`);
+    add('projects', 'priority', `INTEGER NOT NULL DEFAULT 3`);
+    add('projects', 'max_parallel', `INTEGER`);
+    add('workers', 'owner', `TEXT`);
+    add('workers', 'projects', `TEXT`);
+    if (add('projects', 'key', `TEXT NOT NULL DEFAULT ''`)) {
+      // 舊項目沒有短名：用 id 的後四位補一個（已經建好的任務分支名不動）
+      this.db.exec(`UPDATE projects SET key = 'p-' || substr(id, -4) WHERE key = ''`);
+      this.db.exec(`UPDATE tasks SET project_key = (SELECT key FROM projects WHERE projects.id = tasks.project_id) WHERE project_key = ''`);
+    }
   }
 
   /** BEGIN IMMEDIATE：一開始就拿寫鎖，就算將來多進程共用同一個庫，領取也不會互相踩到 */
@@ -112,16 +146,16 @@ export class SqliteStore implements Store {
   insertProject(p: Project) {
     this.db
       .prepare(
-        `INSERT INTO projects (id,title,description,kind,status,created_at,delivered_at)
-         VALUES (@id,@title,@description,@kind,@status,@created_at,@delivered_at)`,
+        `INSERT INTO projects (id,key,priority,max_parallel,title,description,kind,status,created_at,delivered_at)
+         VALUES (@id,@key,@priority,@max_parallel,@title,@description,@kind,@status,@created_at,@delivered_at)`,
       )
       .run(p);
   }
   updateProject(p: Project) {
     this.db
       .prepare(
-        `UPDATE projects SET title=@title, description=@description, kind=@kind, status=@status,
-         delivered_at=@delivered_at WHERE id=@id`,
+        `UPDATE projects SET key=@key, priority=@priority, max_parallel=@max_parallel, title=@title,
+         description=@description, kind=@kind, status=@status, delivered_at=@delivered_at WHERE id=@id`,
       )
       .run(p);
   }
@@ -168,9 +202,9 @@ export class SqliteStore implements Store {
     const { deps: _deps, ...row } = this.toRow(t);
     this.db
       .prepare(
-        `INSERT INTO tasks (id,project_id,key,title,description,acceptance,labels,state,assignee,last_assignee,
+        `INSERT INTO tasks (id,project_id,project_key,key,title,description,acceptance,labels,state,assignee,last_assignee,
            lease_expires_at,attempt,result,reviews,blocked_reason,worklog,progress,branch,created_at,updated_at)
-         VALUES (@id,@project_id,@key,@title,@description,@acceptance,@labels,@state,@assignee,@last_assignee,
+         VALUES (@id,@project_id,@project_key,@key,@title,@description,@acceptance,@labels,@state,@assignee,@last_assignee,
            @lease_expires_at,@attempt,@result,@reviews,@blocked_reason,@worklog,@progress,@branch,
            @created_at,@updated_at)`,
       )
@@ -211,15 +245,26 @@ export class SqliteStore implements Store {
   upsertWorker(w: Worker) {
     this.db
       .prepare(
-        `INSERT INTO workers (id,name,machine,labels,status,current_task,last_seen,registered_at)
-         VALUES (@id,@name,@machine,@labels,@status,@current_task,@last_seen,@registered_at)
-         ON CONFLICT(id) DO UPDATE SET name=@name, machine=@machine, labels=@labels, status=@status,
-           current_task=@current_task, last_seen=@last_seen`,
+        `INSERT INTO workers (id,name,machine,labels,owner,projects,status,current_task,last_seen,registered_at)
+         VALUES (@id,@name,@machine,@labels,@owner,@projects,@status,@current_task,@last_seen,@registered_at)
+         ON CONFLICT(id) DO UPDATE SET name=@name, machine=@machine, labels=@labels, owner=@owner, projects=@projects,
+           status=@status, current_task=@current_task, last_seen=@last_seen`,
       )
-      .run({ ...w, labels: JSON.stringify(w.labels) });
+      .run({
+        id: w.id,
+        name: w.name,
+        machine: w.machine,
+        labels: JSON.stringify(w.labels),
+        owner: w.owner,
+        projects: w.projects ? JSON.stringify(w.projects) : null,
+        status: w.status,
+        current_task: w.current_task,
+        last_seen: w.last_seen,
+        registered_at: w.registered_at,
+      });
   }
   private workerFromRow(r: WorkerRow): Worker {
-    return { ...r, labels: JSON.parse(r.labels) };
+    return { ...r, labels: JSON.parse(r.labels), projects: r.projects ? JSON.parse(r.projects) : null };
   }
   getWorker(id: string) {
     const r = this.db.prepare('SELECT * FROM workers WHERE id=?').get(id) as WorkerRow | undefined;
@@ -229,6 +274,50 @@ export class SqliteStore implements Store {
     return (this.db.prepare('SELECT * FROM workers ORDER BY registered_at, rowid').all() as WorkerRow[]).map((r) =>
       this.workerFromRow(r),
     );
+  }
+
+  // ── users / members ──
+  upsertUser(u: User, tokenHash?: string | null) {
+    this.db
+      .prepare(
+        `INSERT INTO users (id,name,admin,token_hash,created_at) VALUES (@id,@name,@admin,@token_hash,@created_at)
+         ON CONFLICT(id) DO UPDATE SET name=@name, admin=@admin, token_hash=COALESCE(@token_hash, token_hash)`,
+      )
+      .run({ ...u, admin: u.admin ? 1 : 0, token_hash: tokenHash ?? null });
+  }
+  private userFromRow(r: UserRow & { token_hash?: string | null }): User {
+    return { id: r.id, name: r.name, admin: !!r.admin, created_at: r.created_at };
+  }
+  getUser(id: string) {
+    const r = this.db.prepare('SELECT * FROM users WHERE id=?').get(id) as UserRow | undefined;
+    return r && this.userFromRow(r);
+  }
+  findUserByTokenHash(hash: string) {
+    const r = this.db.prepare('SELECT * FROM users WHERE token_hash=?').get(hash) as UserRow | undefined;
+    return r && this.userFromRow(r);
+  }
+  listUsers() {
+    return (this.db.prepare('SELECT * FROM users ORDER BY created_at, rowid').all() as UserRow[]).map((r) =>
+      this.userFromRow(r),
+    );
+  }
+  setMember(m: Member) {
+    this.db
+      .prepare(
+        `INSERT INTO project_members (project_id,user_id,role) VALUES (@project_id,@user_id,@role)
+         ON CONFLICT(project_id,user_id) DO UPDATE SET role=@role`,
+      )
+      .run(m);
+  }
+  removeMember(projectId: string, userId: string) {
+    this.db.prepare('DELETE FROM project_members WHERE project_id=? AND user_id=?').run(projectId, userId);
+  }
+  listMembers(projectId?: string) {
+    return (
+      projectId
+        ? this.db.prepare('SELECT * FROM project_members WHERE project_id=? ORDER BY rowid').all(projectId)
+        : this.db.prepare('SELECT * FROM project_members ORDER BY rowid').all()
+    ) as Member[];
   }
 
   // ── events ──

@@ -58,7 +58,7 @@ export function WorkerAvatar({ worker, color, dock, target }: WorkerProps) {
     }
   });
 
-  const status = offline ? '離線' : target ? null : '閒置';
+  const status = offline ? '離線' : target ? null : worker.busy_elsewhere ? '忙於其他項目' : '閒置';
   return (
     <group ref={group} position={[dock[0], 0.75, dock[2]]} scale={1.25}>
       {/* 身體 */}

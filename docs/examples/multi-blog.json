@@ -1,0 +1,18 @@
+{
+  "title": "部落格搬家",
+  "key": "blog",
+  "priority": 2,
+  "description": "多項目練習：優先級低，不限並行。",
+  "tasks": [
+    {
+      "key": "post",
+      "title": "部落格：寫搬家公告",
+      "acceptance": "五章齊全。"
+    },
+    {
+      "key": "rss",
+      "title": "部落格：寫 RSS 說明",
+      "acceptance": "五章齊全。"
+    }
+  ]
+}

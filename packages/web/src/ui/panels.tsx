@@ -1,7 +1,15 @@
 import { useEffect, useState } from 'react';
-import { INTERRUPT_LABEL, TASK_STATES, type Task, type TaskState } from '@agent-pm/core';
+import {
+  INTERRUPT_LABEL,
+  PRIORITY_LABEL,
+  ROLE_LABEL,
+  TASK_STATES,
+  type Project,
+  type Task,
+  type TaskState,
+} from '@agent-pm/core';
 import { backend } from '../backend.ts';
-import { sortedProjects, useStore, useWorld, type World } from '../store.ts';
+import { sortedProjects, useRole, useStore, useWorld, type World } from '../store.ts';
 import { EVENT_COLOR, STATE_META, WORKER_COLORS, fmtTime } from '../theme.ts';
 
 export function StatePill({ state }: { state: TaskState }) {
@@ -30,6 +38,10 @@ export function TopBar() {
   const [speed, setSpeed] = useState(1);
   const projects = sortedProjects(world);
   const all = progress(world);
+  const me = useStore((s) => s.me);
+  // 管理員（或服務沒啟用鑒權時）可以換成別人的視角，看看對方看得到什麼
+  const canSwitch = !!me && (me.user.admin || !!me.acting_for);
+  const others = useStore((s) => s.roster).filter((u) => !u.admin);
 
   return (
     <header className="topbar">
@@ -55,12 +67,31 @@ export function TopBar() {
               <i style={{ background: p.kind === 'dev' ? '#3b9dff' : '#3ddc97' }} />
               {p.title}
               <em>{p.status === 'delivered' ? '已交付' : `${pr.done}/${pr.total}`}</em>
+              <em className={`prio p${p.priority}`} title={`優先級 ${p.priority}`}>
+                {PRIORITY_LABEL[p.priority] ?? p.priority}
+              </em>
             </button>
           );
         })}
       </nav>
 
       <div className="right">
+        {me &&
+          (canSwitch && others.length > 0 ? (
+            <label className="ident" title="換成別人的視角：只看得到他參與的項目">
+              檢視身分
+              <select value={me.acting_for ? me.user.id : ''} onChange={(e) => backend.viewAs(e.target.value || null)}>
+                <option value="">{me.acting_for?.name ?? me.user.name}（全部項目）</option>
+                {others.map((u) => (
+                  <option key={u.id} value={u.id}>
+                    {u.name}
+                  </option>
+                ))}
+              </select>
+            </label>
+          ) : (
+            me.auth && <span className="ident">{me.user.name}</span>
+          ))}
         {mode === 'demo' && (
           <button
             className="ghost"
@@ -76,7 +107,7 @@ export function TopBar() {
         )}
         <span className={`mode ${mode}`}>
           <i />
-          {mode === 'live' ? '實時連線' : mode === 'demo' ? '瀏覽器內模擬' : '連線中…'}
+          {mode === 'live' ? '實時連線' : mode === 'demo' ? '瀏覽器內模擬' : mode === 'denied' ? 'token 無效' : '連線中…'}
         </span>
         <div className="seg" role="tablist" aria-label="視圖">
           <button className={view === '3d' ? 'on' : ''} onClick={() => set({ view: '3d' })}>
@@ -118,7 +149,7 @@ export function Feed() {
   const set = useStore((s) => s.set);
   // 檢查點很頻繁，放進動態會把別的事件沖掉；它們在任務側欄的「接力記錄」裡
   const shown = (replayIdx === null ? events : events.slice(0, replayIdx))
-    .filter((e) => e.type !== 'task_checkpoint')
+    .filter((e) => e.type !== 'task_checkpoint' && e.message)
     .slice(-7)
     .reverse();
   return (
@@ -200,6 +231,7 @@ export function SidePanel() {
   const [comment, setComment] = useState('');
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
+  const role = useRole(selected ? world.tasks[selected]?.project_id : undefined);
 
   useEffect(() => {
     setComment('');
@@ -230,6 +262,7 @@ export function SidePanel() {
   };
   const hands = new Set(task.worklog.map((e) => e.worker_id)).size;
   const replaying = replayIdx !== null;
+  const canManage = role === 'manager';
 
   const act = async (fn: () => Promise<unknown>) => {
     if (!backend.api) return;
@@ -255,7 +288,7 @@ export function SidePanel() {
       </header>
       <h2>{task.title}</h2>
       <p className="muted">
-        {project?.title} · <code>{task.key}</code>
+        {project?.title} · <code>{task.project_key}/{task.key}</code>
       </p>
 
       <dl>
@@ -339,7 +372,12 @@ export function SidePanel() {
         )}
       </dl>
 
-      {!replaying && task.state === 'in_review' && (
+      {!replaying && !canManage && (task.state === 'in_review' || task.state === 'blocked') && (
+        <p className="muted">
+          你在這個項目裡是{role ? ROLE_LABEL[role] : '訪客'}，只有負責人可以{task.state === 'blocked' ? '解除阻塞' : ' review'}。
+        </p>
+      )}
+      {!replaying && canManage && task.state === 'in_review' && (
         <div className="actions">
           <textarea
             id="review-comment"
@@ -366,7 +404,7 @@ export function SidePanel() {
           </div>
         </div>
       )}
-      {!replaying && task.state === 'blocked' && (
+      {!replaying && canManage && task.state === 'blocked' && (
         <div className="actions">
           <button className="approve" disabled={busy} onClick={() => act(() => backend.api!.unblock(task.id, '你'))}>
             解除阻塞，放回任務池
@@ -419,6 +457,72 @@ export function SidePanel() {
   );
 }
 
+// ───────────────────────── 項目設定：優先級、並行配額、成員 ─────────────────────────
+
+const running = (world: World, projectId: string) =>
+  Object.values(world.tasks).filter((t) => t.project_id === projectId && t.state === 'claimed').length;
+
+/** 負責人可以在這裡調優先級和並行配額，立刻生效；其他人只能看。 */
+function ProjectSettings({ project: p, running }: { project: Project; running: number }) {
+  const role = useRole(p.id);
+  const members = useStore((s) => s.members).filter((m) => m.project_id === p.id);
+  const users = useStore((s) => s.users);
+  const replaying = useStore((s) => s.replayIdx !== null);
+  const [error, setError] = useState('');
+  const can = role === 'manager' && !replaying && p.status === 'active';
+  const patch = (body: { priority?: number; max_parallel?: number | null }) => {
+    setError('');
+    backend.api?.updateProject(p.id, body).catch((err) => setError(err instanceof Error ? err.message : String(err)));
+  };
+  const full = p.max_parallel !== null && running >= p.max_parallel;
+  return (
+    <div className="psettings">
+      <label>
+        優先級
+        <select value={p.priority} disabled={!can} onChange={(e) => patch({ priority: Number(e.target.value) })}>
+          {[5, 4, 3, 2, 1].map((n) => (
+            <option key={n} value={n}>
+              {n} · {PRIORITY_LABEL[n]}
+            </option>
+          ))}
+        </select>
+      </label>
+      <label>
+        並行配額
+        <select
+          value={p.max_parallel ?? ''}
+          disabled={!can}
+          onChange={(e) => patch({ max_parallel: e.target.value === '' ? null : Number(e.target.value) })}
+        >
+          <option value="">不限</option>
+          <option value="0">0 · 暫停派工</option>
+          {[1, 2, 3, 4, 5, 6, 8].map((n) => (
+            <option key={n} value={n}>
+              {n}
+            </option>
+          ))}
+        </select>
+      </label>
+      <span className={full ? 'full' : 'muted'}>
+        執行中 {running}
+        {p.max_parallel !== null ? `/${p.max_parallel}` : ''}
+        {full && p.max_parallel !== 0 ? ' · 配額已滿' : ''}
+      </span>
+      <span className="members">
+        成員：
+        {members.length === 0 && <em>只有管理員</em>}
+        {members.map((m) => (
+          <em key={m.user_id}>
+            {users[m.user_id]?.name ?? m.user_id} <small>{ROLE_LABEL[m.role]}</small>
+          </em>
+        ))}
+      </span>
+      {role && role !== 'manager' && <span className="muted">你是{ROLE_LABEL[role]}，不能改設定</span>}
+      {error && <span className="warn">{error}</span>}
+    </div>
+  );
+}
+
 // ───────────────────────── 2D 列表視圖 ─────────────────────────
 
 export function ListView() {
@@ -430,6 +534,7 @@ export function ListView() {
   const projects = sortedProjects(world).filter((p) => focus === 'all' || p.id === focus);
   const workers = Object.values(world.workers).sort((a, b) => a.registered_at - b.registered_at || a.id.localeCompare(b.id));
   const name = (id: string | null) => workers.find((w) => w.id === id)?.name ?? id ?? '';
+  const users = useStore((s) => s.users);
 
   return (
     <main className="list">
@@ -460,10 +565,12 @@ export function ListView() {
             <h2>
               {p.title}
               <span className="muted">
-                {p.kind === 'dev' ? '研發項目' : '日常雜事'} · {p.status === 'delivered' ? 'PM 已交付' : `${pr.done}/${pr.total} 完成`}
+                <code>{p.key}</code> · {p.kind === 'dev' ? '研發項目' : '日常雜事'} ·{' '}
+                {p.status === 'delivered' ? 'PM 已交付' : `${pr.done}/${pr.total} 完成`}
               </span>
             </h2>
             <p className="muted">{p.description}</p>
+            <ProjectSettings project={p} running={running(world, p.id)} />
             <div className="tablewrap">
               <table>
                 <thead>
@@ -536,7 +643,10 @@ export function ListView() {
               <header>
                 <i style={{ background: WORKER_COLORS[i % WORKER_COLORS.length] }} />
                 <strong>{w.name}</strong>
-                <span className="muted">{w.machine}</span>
+                <span className="muted">
+                  {w.machine}
+                  {w.owner && users[w.owner] ? ` · ${users[w.owner].name} 的` : ''}
+                </span>
               </header>
               <div className="chips">
                 {w.labels.map((l) => (
@@ -548,7 +658,9 @@ export function ListView() {
                   ? '離線（心跳中斷）'
                   : w.current_task
                     ? `執行中：${world.tasks[w.current_task]?.title ?? w.current_task}`
-                    : '閒置，等待任務'}
+                    : w.busy_elsewhere
+                      ? '忙於你看不到的項目'
+                      : '閒置，等待任務'}
               </p>
             </article>
           ))}

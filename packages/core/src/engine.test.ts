@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { Engine, MemoryStore, PmError, type PmEvent } from './index.ts';
+import { Engine, MemoryStore, PmError, scoped, type PmEvent } from './index.ts';
 
 function setup(leaseMs = 1000) {
   let now = 1_000_000;
@@ -271,4 +271,169 @@ test('斷線後自己回來：優先領回自己做到一半的任務', () => {
   const back = engine.claimTask('w1')!;
   assert.equal(back.id, b.id);
   assert.ok(events.some((e) => e.type === 'task_resumed' && /甲 回來繼續/.test(e.message)));
+});
+
+// ───────────────────────── 一個 PM 管多個項目 ─────────────────────────
+
+const one = (key: string, extra: object = {}) => ({
+  key,
+  title: `項目 ${key}`,
+  tasks: [
+    { key: 'x', title: `${key}-x` },
+    { key: 'y', title: `${key}-y` },
+    { key: 'z', title: `${key}-z` },
+  ],
+  ...extra,
+});
+
+test('共用倉庫：分支名帶項目短名，短名不能重複', () => {
+  const { engine } = setup();
+  const site = engine.createProject(one('site'));
+  const blog = engine.createProject(one('blog'));
+  // 兩個項目裡同名的任務，分支落在各自項目的前綴下
+  assert.match(site.tasks[0].branch, /^project\/site\/x-[a-z0-9]{4}$/);
+  assert.match(blog.tasks[0].branch, /^project\/blog\/x-[a-z0-9]{4}$/);
+  assert.equal(site.tasks[0].project_key, 'site');
+  assert.throws(() => engine.createProject(one('site')), /已被另一個項目使用/);
+  assert.throws(() => engine.createProject(one('My Site')), /短名/);
+  // 歸檔後短名可以重新使用
+  engine.archiveProject(site.project.id);
+  engine.createProject(one('site'));
+  // 不給短名會自動生成一個
+  assert.match(engine.createProject({ title: '沒給短名', tasks: [{ key: 'a', title: 'A' }] }).project.key, /^p-[a-z0-9]{4}$/);
+});
+
+test('優先級：先領優先級高的項目；PM 調整後立刻按新的順序', () => {
+  const { engine, events } = setup();
+  const low = engine.createProject(one('low', { priority: 2 }));
+  const high = engine.createProject(one('high', { priority: 4 }));
+  engine.registerWorker({ id: 'w1' });
+  engine.registerWorker({ id: 'w2' });
+  // low 先建立，但 high 優先級高
+  assert.equal(engine.claimTask('w1')!.project_id, high.project.id);
+  // PM 把 low 調成緊急
+  engine.updateProject('low', { priority: 5 });
+  assert.equal(events.at(-1)!.type, 'project_updated');
+  assert.match(events.at(-1)!.message, /優先級 2 → 5/);
+  assert.equal(engine.claimTask('w2')!.project_id, low.project.id);
+  assert.throws(() => engine.updateProject('low', { priority: 9 }), /1 到 5/);
+});
+
+test('並行配額：滿了就領不到這個項目的任務，名額空出來才能再領', () => {
+  const { engine } = setup();
+  const hot = engine.createProject(one('hot', { priority: 5, max_parallel: 2 }));
+  const cold = engine.createProject(one('cold', { priority: 1 }));
+  for (const id of ['w1', 'w2', 'w3']) engine.registerWorker({ id });
+  const t1 = engine.claimTask('w1')!;
+  const t2 = engine.claimTask('w2')!;
+  assert.deepEqual([t1.project_id, t2.project_id], [hot.project.id, hot.project.id]);
+  // hot 還有一個 ready 的任務，但名額已滿：第三個 worker 被分到優先級低的項目
+  const left = hot.tasks.find((t) => t.id !== t1.id && t.id !== t2.id)!;
+  assert.throws(() => engine.claimTask('w3', left.id), /並行配額 2 已滿/);
+  assert.equal(engine.claimTask('w3')!.project_id, cold.project.id);
+  // w1 交付後空出一個名額
+  engine.submitResult('w1', t1.id, { summary: 'ok' });
+  assert.equal(engine.claimTask('w1')!.id, left.id);
+  // 配額設成 0 等於暫停派工：正在做的不受影響，新的領不到
+  engine.updateProject('cold', { max_parallel: 0 });
+  engine.submitResult('w2', t2.id, { summary: 'ok' });
+  assert.equal(engine.claimTask('w2'), null);
+  assert.equal(engine.getTask(engine.getWorker('w3').current_task!).state, 'claimed');
+  // 改回不限
+  engine.updateProject('cold', { max_parallel: null });
+  assert.equal(engine.claimTask('w2')!.project_id, cold.project.id);
+});
+
+test('權限：worker 只能領主人有權參與的項目；也可以自己限定只做某些項目', () => {
+  const { engine } = setup();
+  engine.upsertUser({ id: 'boss', name: '老闆', admin: true });
+  engine.upsertUser({ id: 'amy', name: 'Amy' });
+  engine.upsertUser({ id: 'bob', name: 'Bob' });
+  const site = engine.createProject(one('site', { priority: 5, members: [{ user_id: 'amy', role: 'contributor' }] }));
+  const blog = engine.createProject(one('blog', { members: [{ user_id: 'bob', role: 'contributor' }, { user_id: 'amy', role: 'viewer' }] }));
+  engine.registerWorker({ id: 'amy-pc', owner: 'amy' });
+  engine.registerWorker({ id: 'bob-pc', owner: 'bob' });
+  engine.registerWorker({ id: 'boss-pc', owner: 'boss' });
+  engine.registerWorker({ id: 'boss-nas', owner: 'boss', projects: ['blog'] });
+
+  // Amy 在 site 是參與者，在 blog 只是觀察者：她的 worker 只領得到 site
+  assert.deepEqual(new Set(engine.listClaimable('amy-pc').map((t) => t.project_id)), new Set([site.project.id]));
+  // Bob 不是 site 的成員：優先級再高也領不到，指定領取會被拒絕
+  assert.deepEqual(new Set(engine.listClaimable('bob-pc').map((t) => t.project_id)), new Set([blog.project.id]));
+  assert.throws(() => engine.claimTask('bob-pc', site.tasks[0].id), /沒有參與項目/);
+  // 管理員的 worker 兩個項目都能領，先領優先級高的
+  assert.equal(engine.claimTask('boss-pc')!.project_id, site.project.id);
+  // 但限定了項目的那台只做 blog
+  assert.equal(engine.claimTask('boss-nas')!.project_id, blog.project.id);
+  // 把 Bob 加進 site 之後他就領得到了
+  engine.setMember('site', 'bob', 'contributor');
+  assert.equal(engine.claimTask('bob-pc')!.project_id, site.project.id);
+});
+
+test('權限：不是成員就看不到項目、任務和事件；別人的 worker 在看不到的項目裡做什麼會被抹掉', () => {
+  const { engine } = setup();
+  const amy = engine.upsertUser({ id: 'amy', name: 'Amy' });
+  const bob = engine.upsertUser({ id: 'bob', name: 'Bob' });
+  const eve = engine.upsertUser({ id: 'eve', name: 'Eve' });
+  const shared = engine.createProject(
+    one('shared', { priority: 1, members: [{ user_id: 'amy', role: 'manager' }, { user_id: 'bob', role: 'contributor' }] }),
+  );
+  const secret = engine.createProject(one('secret', { priority: 5, members: [{ user_id: 'bob', role: 'manager' }] }));
+  engine.registerWorker({ id: 'bob-pc', name: 'Bob 的電腦', owner: 'bob' });
+  const t = engine.claimTask('bob-pc')!; // 優先級高的 secret
+  assert.equal(t.project_id, secret.project.id);
+
+  const forAmy = scoped(engine, amy).snapshot();
+  assert.deepEqual(forAmy.projects.map((p) => p.key), ['shared']);
+  assert.ok(forAmy.tasks.every((x) => x.project_id === shared.project.id));
+  // Amy 看得到 Bob 的 worker（他們有共同的項目），但只知道它「忙於其他項目」
+  const w = forAmy.workers.find((x) => x.id === 'bob-pc')!;
+  assert.equal(w.current_task, null);
+  assert.equal(w.busy_elsewhere, true);
+  // 事件裡也沒有 secret 的任何內容
+  const evs = scoped(engine, amy).events();
+  assert.ok(evs.every((e) => !JSON.stringify(e).includes('secret')));
+  assert.ok(evs.some((e) => e.type === 'worker_updated' && e.worker?.busy_elsewhere));
+  // 看不到的任務說「不存在」，不洩漏它存在
+  assert.throws(() => scoped(engine, amy).getTask(t.id), (e: PmError) => e.code === 'not_found');
+  // Bob 兩個都看得到；Eve 什麼都看不到，連 worker 也看不到
+  assert.deepEqual(scoped(engine, bob).snapshot().projects.map((p) => p.key).sort(), ['secret', 'shared']);
+  const forEve = scoped(engine, eve).snapshot();
+  assert.deepEqual([forEve.projects.length, forEve.tasks.length, forEve.workers.length], [0, 0, 0]);
+  // 管理員（未啟用鑒權時的預設身分）看到全部
+  assert.equal(scoped(engine).snapshot().projects.length, 2);
+});
+
+test('權限：只有負責人能 review、改設定、管成員；只能操作自己的 worker', () => {
+  const { engine } = setup();
+  const amy = engine.upsertUser({ id: 'amy', name: 'Amy' });
+  const bob = engine.upsertUser({ id: 'bob', name: 'Bob' });
+  const cat = engine.upsertUser({ id: 'cat', name: 'Cat' });
+  // 非管理員建項目，自動成為負責人
+  const { project, tasks } = scoped(engine, amy).createProject(
+    one('amys', { members: [{ user_id: 'bob', role: 'contributor' }, { user_id: 'cat', role: 'viewer' }] }),
+  );
+  assert.equal(engine.roleOf(amy, project.id), 'manager');
+  // worker 登記在誰名下由 token 決定，不能冒名，也不能動別人的 worker
+  const w = scoped(engine, bob).registerWorker({ id: 'bob-pc', owner: 'amy' });
+  assert.equal(w.owner, 'bob');
+  assert.throws(() => scoped(engine, cat).claimTask('bob-pc'), (e: PmError) => e.code === 'forbidden');
+  assert.throws(() => scoped(engine, cat).registerWorker({ id: 'bob-pc' }), /別人名下/);
+  const t = scoped(engine, bob).claimTask('bob-pc')!;
+  scoped(engine, bob).submitResult('bob-pc', t.id, { summary: '做完了' });
+  // 參與者和觀察者不能 review，負責人可以；review 記錄上的名字是負責人自己
+  assert.throws(() => scoped(engine, bob).review(t.id, { decision: 'approve' }), (e: PmError) => e.code === 'forbidden');
+  assert.throws(() => scoped(engine, cat).review(t.id, { decision: 'approve' }), (e: PmError) => e.code === 'forbidden');
+  const done = scoped(engine, amy).review(t.id, { decision: 'approve', reviewer: '冒名' });
+  assert.equal(done.reviews.at(-1)!.reviewer, 'Amy');
+  // 設定和成員同理
+  assert.throws(() => scoped(engine, bob).updateProject(project.id, { priority: 5 }), (e: PmError) => e.code === 'forbidden');
+  assert.throws(() => scoped(engine, bob).setMember(project.id, 'cat', 'manager'), (e: PmError) => e.code === 'forbidden');
+  assert.equal(scoped(engine, amy).updateProject(project.id, { priority: 5 }).priority, 5);
+  // 觀察者看得到，但被移出後就看不到了
+  assert.equal(scoped(engine, cat).snapshot().tasks.length, tasks.length);
+  scoped(engine, amy).setMember(project.id, 'cat', null);
+  assert.equal(scoped(engine, cat).snapshot().projects.length, 0);
+  // 只有管理員能建用戶
+  assert.throws(() => scoped(engine, amy).upsertUser({ name: '新人' }), (e: PmError) => e.code === 'forbidden');
 });

@@ -1,11 +1,17 @@
 import type { Store } from './store.ts';
 import {
   PmError,
+  ROLE_LABEL,
   type EventType,
   type PmEvent,
   type InterruptReason,
+  type Member,
   type Project,
   type ProjectInput,
+  type ProjectPatch,
+  type ProjectRole,
+  type User,
+  type UserInput,
   type ResumeContext,
   type Review,
   type Snapshot,
@@ -16,6 +22,7 @@ import {
 } from './types.ts';
 
 const MAX_WORKLOG = 40;
+const ROLE_NAME = ROLE_LABEL;
 
 export const INTERRUPT_LABEL: Record<InterruptReason | 'changes_requested', string> = {
   lease_expired: '斷線，租約超時',
@@ -51,6 +58,14 @@ export function buildResume(task: Task): ResumeContext | null {
     checkpoints: checkpoints.length,
   };
 }
+
+/** 沒有啟用鑒權時，所有請求都以這個內建管理員的身分執行 */
+export const ROOT_USER: User = { id: 'root', name: '管理員', admin: true, created_at: 0 };
+
+const KEY_RE = /^[a-z0-9][a-z0-9-]{0,31}$/;
+const ROLES: ProjectRole[] = ['manager', 'contributor', 'viewer'];
+/** 任務 key 放進分支名之前，把 git 不接受的字元換掉 */
+const refSafe = (s: string) => s.replace(/[^A-Za-z0-9._-]+/g, '-').replace(/^[-.]+|[-.]+$/g, '') || 'task';
 
 export interface EngineOptions {
   /** 租約時長：領取後超過這麼久沒有心跳，任務自動回到任務池 */
@@ -198,11 +213,29 @@ export class Engine {
       }
     }
     if (seen !== input.tasks.length) throw new PmError('invalid', '任務依賴存在環，必須是有向無環圖');
+    if (input.key !== undefined && !KEY_RE.test(input.key)) {
+      throw new PmError('invalid', '項目短名 key 只能用小寫字母、數字和連字號，最長 32 個字元，例如 site');
+    }
+    const priority = this.checkPriority(input.priority ?? 3);
+    const maxParallel = this.checkQuota(input.max_parallel ?? null);
+    for (const m of input.members ?? []) {
+      if (!ROLES.includes(m.role)) throw new PmError('invalid', `角色只能是 ${ROLES.join(' / ')}`);
+    }
 
     return this.run(() => {
       const now = this.nowFn();
+      const id = rid('p');
+      const key = input.key ?? `p-${id.slice(-4)}`;
+      // 分支名靠短名區分項目，所以還在用的項目之間短名不能重複
+      if (this.store.listProjects().some((p) => p.status !== 'archived' && p.key === key)) {
+        throw new PmError('conflict', `項目短名 ${key} 已被另一個項目使用`);
+      }
+      for (const m of input.members ?? []) this.mustUser(m.user_id);
       const project: Project = {
-        id: rid('p'),
+        id,
+        key,
+        priority,
+        max_parallel: maxParallel,
         title: input.title.trim(),
         description: input.description ?? '',
         kind: input.kind ?? 'dev',
@@ -216,6 +249,7 @@ export class Engine {
       const tasks: Task[] = input.tasks.map((t) => ({
         id: idOf.get(t.key)!,
         project_id: project.id,
+        project_key: project.key,
         key: t.key,
         title: t.title,
         description: t.description ?? '',
@@ -232,19 +266,140 @@ export class Engine {
         blocked_reason: null,
         worklog: [],
         progress: 0,
-        branch: `task/${t.key}-${idOf.get(t.key)!.slice(-4)}`,
+        branch: `project/${project.key}/${refSafe(t.key)}-${idOf.get(t.key)!.slice(-4)}`,
         created_at: now,
         updated_at: now,
       }));
       for (const t of tasks) this.store.insertTask(t);
+      for (const m of input.members ?? []) {
+        this.store.setMember({ project_id: project.id, user_id: m.user_id, role: m.role });
+      }
 
       this.emit('project_created', `PM 建立項目「${project.title}」，拆解為 ${tasks.length} 個任務`, {
         project_id: project.id,
         project,
         tasks,
+        members: this.store.listMembers(project.id),
       });
       return { project, tasks };
     });
+  }
+
+  private checkPriority(v: unknown): number {
+    const n = Number(v);
+    if (!Number.isInteger(n) || n < 1 || n > 5) throw new PmError('invalid', '優先級 priority 必須是 1 到 5 的整數');
+    return n;
+  }
+
+  private checkQuota(v: unknown): number | null {
+    if (v === null || v === undefined || v === '') return null;
+    const n = Number(v);
+    if (!Number.isInteger(n) || n < 0) throw new PmError('invalid', '並行配額 max_parallel 必須是 0 以上的整數，或 null 表示不限');
+    return n;
+  }
+
+  private mustProject(id: string): Project {
+    // 接受 id，也接受短名（方便人手打命令）
+    const p = this.store.getProject(id) ?? this.store.listProjects().find((x) => x.key === id && x.status !== 'archived');
+    if (!p) throw new PmError('not_found', `項目 ${id} 不存在`);
+    return p;
+  }
+
+  private mustUser(id: string): User {
+    const u = this.store.getUser(id);
+    if (!u) throw new PmError('not_found', `用戶 ${id} 不存在`);
+    return u;
+  }
+
+  getProject(id: string): Project {
+    return this.mustProject(id);
+  }
+
+  /** 調整項目的優先級和並行配額。立刻生效：下一次有人領任務就按新的規則排。 */
+  updateProject(id: string, patch: ProjectPatch, by = 'PM'): Project {
+    return this.run(() => {
+      const p = this.mustProject(id);
+      const changes: string[] = [];
+      if (patch.priority !== undefined) {
+        const v = this.checkPriority(patch.priority);
+        if (v !== p.priority) changes.push(`優先級 ${p.priority} → ${v}`);
+        p.priority = v;
+      }
+      if (patch.max_parallel !== undefined) {
+        const v = this.checkQuota(patch.max_parallel);
+        if (v !== p.max_parallel) changes.push(`並行配額 ${p.max_parallel ?? '不限'} → ${v ?? '不限'}`);
+        p.max_parallel = v;
+      }
+      if (!changes.length) return p;
+      this.store.updateProject(p);
+      this.emit('project_updated', `${by} 調整項目「${p.title}」：${changes.join('，')}`, { project_id: p.id, project: p });
+      return p;
+    });
+  }
+
+  // ───────────────────────── 身分與權限 ─────────────────────────
+
+  /** 建立或更新一個用戶。tokenHash 由服務端生成 token 後算好傳入。 */
+  upsertUser(input: UserInput, tokenHash?: string | null): User {
+    if (!input.name?.trim()) throw new PmError('invalid', '用戶需要 name');
+    if (input.id !== undefined && !KEY_RE.test(input.id)) {
+      throw new PmError('invalid', '用戶 id 只能用小寫字母、數字和連字號');
+    }
+    if (input.id === ROOT_USER.id) throw new PmError('invalid', `${ROOT_USER.id} 是保留的 id`);
+    return this.run(() => {
+      const prev = input.id ? this.store.getUser(input.id) : undefined;
+      const u: User = {
+        id: input.id ?? rid('u').replace('_', '-'),
+        name: input.name.trim(),
+        admin: input.admin ?? prev?.admin ?? false,
+        created_at: prev?.created_at ?? this.nowFn(),
+      };
+      this.store.upsertUser(u, tokenHash);
+      return u;
+    });
+  }
+
+  userByTokenHash(hash: string): User | undefined {
+    return this.store.findUserByTokenHash(hash);
+  }
+
+  getUser(id: string): User | undefined {
+    return id === ROOT_USER.id ? ROOT_USER : this.store.getUser(id);
+  }
+
+  /** 設定或移除（role 為 null）項目成員 */
+  setMember(projectId: string, userId: string, role: ProjectRole | null, by = 'PM'): Member[] {
+    if (role !== null && !ROLES.includes(role)) throw new PmError('invalid', `角色只能是 ${ROLES.join(' / ')}`);
+    return this.run(() => {
+      const p = this.mustProject(projectId);
+      const u = this.mustUser(userId);
+      if (role) this.store.setMember({ project_id: p.id, user_id: u.id, role });
+      else this.store.removeMember(p.id, u.id);
+      const members = this.store.listMembers(p.id);
+      this.emit(
+        'member_changed',
+        role ? `${by} 把 ${u.name} 設為「${p.title}」的${ROLE_NAME[role]}` : `${by} 把 ${u.name} 移出「${p.title}」`,
+        { project_id: p.id, project: p, members },
+      );
+      return members;
+    });
+  }
+
+  /** actor 在這個項目裡的角色；管理員一律是 manager；不是成員返回 null（看不到這個項目） */
+  roleOf(actor: User, projectId: string): ProjectRole | null {
+    if (actor.admin) return 'manager';
+    return this.store.listMembers(projectId).find((m) => m.user_id === actor.id)?.role ?? null;
+  }
+
+  /** worker 能不能為這個項目幹活：看它的主人有沒有參與權，以及它自己有沒有限定項目 */
+  private workerAllowed(w: Worker, p: Project, members: Member[]): boolean {
+    if (w.projects && !w.projects.includes(p.key)) return false;
+    if (!w.owner) return true;
+    const owner = this.getUser(w.owner);
+    if (!owner) return false;
+    if (owner.admin) return true;
+    const role = members.find((m) => m.project_id === p.id && m.user_id === owner.id)?.role;
+    return role === 'manager' || role === 'contributor';
   }
 
   archiveProject(id: string): Project {
@@ -270,6 +425,8 @@ export class Engine {
         name: input.name ?? prev?.name ?? input.id,
         machine: input.machine ?? prev?.machine ?? '',
         labels: input.labels ?? prev?.labels ?? [],
+        owner: input.owner !== undefined ? input.owner : (prev?.owner ?? null),
+        projects: input.projects !== undefined ? (input.projects?.length ? input.projects : null) : (prev?.projects ?? null),
         status: 'online',
         current_task: prev?.current_task ?? null,
         last_seen: now,
@@ -285,35 +442,63 @@ export class Engine {
     });
   }
 
-  /** 這個 worker 目前可以領取的任務：ready 或 changes_requested，且能力標籤滿足。 */
+  /** 每個項目現在有幾個任務正在執行（用來算並行配額） */
+  private runningByProject(tasks: Task[]): Map<string, number> {
+    const m = new Map<string, number>();
+    for (const t of tasks) if (t.state === 'claimed') m.set(t.project_id, (m.get(t.project_id) ?? 0) + 1);
+    return m;
+  }
+
+  /** 這個 worker 目前可以領取的任務，按「應該先做哪個」排好。
+   *  過濾：項目進行中、worker 的主人有權參與、能力標籤滿足、項目的並行配額還沒滿。
+   *  排序：項目優先級高的在前；同優先級裡先還自己做到一半的；再讓正在執行的任務較少的項目先拿（避免一個項目吃光所有人）。 */
   listClaimable(workerId: string): Task[] {
     const w = this.mustWorker(workerId);
-    const active = new Set(
+    const projects = new Map(
       this.store
         .listProjects()
         .filter((p) => p.status === 'active')
-        .map((p) => p.id),
+        .map((p) => [p.id, p]),
     );
-    return this.store
-      .listTasks()
+    const members = this.store.listMembers();
+    const all = this.store.listTasks();
+    const running = this.runningByProject(all);
+    const open = (p: Project) => p.max_parallel === null || (running.get(p.id) ?? 0) < p.max_parallel;
+    const allowed = new Map([...projects.values()].map((p) => [p.id, this.workerAllowed(w, p, members) && open(p)]));
+    // 自己做到一半的（被退回、斷線後回來）優先還給自己，上下文最完整；
+    // 但自己剛因為額度用完或被人打斷而交出去的排到最後，留給別人接手
+    const rank = (t: Task) => {
+      if (t.last_assignee !== w.id) return 1;
+      const stop = t.worklog.at(-1);
+      const handedOff = stop?.kind === 'interrupted' && (stop.reason === 'usage_limit' || stop.reason === 'interrupted');
+      return handedOff ? 2 : 0;
+    };
+    return all
       .filter(
-        (t) =>
-          active.has(t.project_id) &&
-          (t.state === 'ready' || t.state === 'changes_requested') &&
-          this.canDo(w, t),
+        (t) => allowed.get(t.project_id) && (t.state === 'ready' || t.state === 'changes_requested') && this.canDo(w, t),
       )
       .sort((a, b) => {
-        // 自己做到一半的（被退回、斷線後回來）優先還給自己，上下文最完整；
-        // 但自己剛因為額度用完或被人打斷而交出去的排到最後，留給別人接手
-        const rank = (t: Task) => {
-          if (t.last_assignee !== w.id) return 1;
-          const stop = t.worklog.at(-1);
-          const handedOff =
-            stop?.kind === 'interrupted' && (stop.reason === 'usage_limit' || stop.reason === 'interrupted');
-          return handedOff ? 2 : 0;
-        };
-        return rank(a) - rank(b) || a.created_at - b.created_at;
+        const pa = projects.get(a.project_id)!;
+        const pb = projects.get(b.project_id)!;
+        return (
+          pb.priority - pa.priority ||
+          rank(a) - rank(b) ||
+          (running.get(pa.id) ?? 0) - (running.get(pb.id) ?? 0) ||
+          a.created_at - b.created_at
+        );
       });
+  }
+
+  /** 為什麼這個 worker 領不到這個任務（給指定任務領取時的錯誤訊息用） */
+  private whyNot(w: Worker, t: Task): string {
+    const p = this.store.getProject(t.project_id);
+    if (!p || p.status !== 'active') return '項目不在進行中';
+    if (t.state !== 'ready' && t.state !== 'changes_requested') return `狀態 ${t.state}`;
+    if (!this.workerAllowed(w, p, this.store.listMembers(p.id))) return `${w.name} 沒有參與項目「${p.title}」的權限`;
+    if (!this.canDo(w, t)) return '能力標籤不符';
+    const running = this.runningByProject(this.store.listTasks(p.id)).get(p.id) ?? 0;
+    if (p.max_parallel !== null && running >= p.max_parallel) return `項目「${p.title}」的並行配額 ${p.max_parallel} 已滿`;
+    return '已被別人領走';
   }
 
   /** 原子領取。不傳 taskId 則自動挑一個適合的；沒有可領的返回 null。 */
@@ -329,7 +514,7 @@ export class Engine {
       const candidates = this.listClaimable(workerId).filter((t) => !taskId || t.id === taskId);
       if (taskId && !candidates.length) {
         const t = this.mustTask(taskId);
-        throw new PmError('conflict', `任務「${t.title}」目前不可領取（狀態 ${t.state}，或能力標籤不符）`);
+        throw new PmError('conflict', `任務「${t.title}」目前不可領取：${this.whyNot(w, t)}`);
       }
       const now = this.nowFn();
       for (const c of candidates) {
@@ -655,6 +840,10 @@ export class Engine {
     return this.mustTask(id);
   }
 
+  getWorker(id: string): Worker {
+    return this.mustWorker(id);
+  }
+
   snapshot(includeArchived = false): Snapshot {
     const projects = this.store.listProjects().filter((p) => includeArchived || p.status !== 'archived');
     const ids = new Set(projects.map((p) => p.id));
@@ -664,8 +853,81 @@ export class Engine {
       projects,
       tasks: this.store.listTasks().filter((t) => ids.has(t.project_id)),
       workers: this.store.listWorkers(),
+      users: this.store.listUsers(),
+      members: this.store.listMembers().filter((m) => ids.has(m.project_id)),
       last_event_id: this.store.lastEventId(),
     };
+  }
+
+  // ───────────────────────── 按身分過濾的視圖 ─────────────────────────
+  //
+  // 規則只有一條：不是項目成員，就看不到這個項目的任何東西（項目、任務、事件）。
+  // worker 會跨項目幹活，所以別人的 worker 你看得到（如果你們有共同的項目），
+  // 但它在你看不到的項目裡做什麼會被抹掉，只留一個「忙於其他項目」。
+
+  /** actor 看得到哪些項目 */
+  visibleProjects(actor: User): Set<string> {
+    const all = this.store.listProjects().filter((p) => p.status !== 'archived');
+    if (actor.admin) return new Set(all.map((p) => p.id));
+    const mine = new Set(this.store.listMembers().filter((m) => m.user_id === actor.id).map((m) => m.project_id));
+    return new Set(all.filter((p) => mine.has(p.id)).map((p) => p.id));
+  }
+
+  /** 過濾用的上下文，算一次可以連著過濾很多事件 */
+  viewOf(actor: User) {
+    const visible = this.visibleProjects(actor);
+    const members = this.store.listMembers();
+    // 和我有共同項目的人
+    const peers = new Set(members.filter((m) => visible.has(m.project_id)).map((m) => m.user_id));
+    peers.add(actor.id);
+    const admins = new Set(this.store.listUsers().filter((u) => u.admin).map((u) => u.id));
+    const taskProject = new Map<string, string>();
+    const seesWorker = (w: Worker) => actor.admin || !w.owner || admins.has(w.owner) || peers.has(w.owner);
+    const projectOfTask = (id: string) => {
+      if (!taskProject.has(id)) taskProject.set(id, this.store.getTask(id)?.project_id ?? '');
+      return taskProject.get(id)!;
+    };
+    const redact = (w: Worker): Worker => {
+      if (actor.admin || !w.current_task || visible.has(projectOfTask(w.current_task))) return w;
+      return { ...w, current_task: null, busy_elsewhere: true };
+    };
+    return { actor, visible, peers, seesWorker, redact };
+  }
+
+  viewSnapshot(actor: User): Snapshot {
+    const snap = this.snapshot();
+    if (actor.admin) return snap;
+    const v = this.viewOf(actor);
+    return {
+      ...snap,
+      projects: snap.projects.filter((p) => v.visible.has(p.id)),
+      tasks: snap.tasks.filter((t) => v.visible.has(t.project_id)),
+      workers: snap.workers.filter(v.seesWorker).map(v.redact),
+      // 看得到和自己有共同項目的人，以及管理員（他們的 worker 會出現在你的項目裡）
+      users: snap.users.filter((u) => u.admin || v.peers.has(u.id)),
+      members: snap.members.filter((m) => v.visible.has(m.project_id)),
+    };
+  }
+
+  /** 把一個事件變成 actor 該看到的樣子；完全不該看到就返回 null */
+  viewEvent(view: ReturnType<Engine['viewOf']>, ev: PmEvent): PmEvent | null {
+    if (view.actor.admin) return ev;
+    const worker = ev.worker && view.seesWorker(ev.worker) ? view.redact(ev.worker) : undefined;
+    if (ev.project_id) {
+      if (view.visible.has(ev.project_id)) return ev.worker ? { ...ev, worker } : ev;
+      // 看不到的項目裡發生的事：只告訴你「你看得到的那個 worker 現在忙不忙」
+      if (!worker || ev.type === 'heartbeat') return null;
+      return { id: ev.id, ts: ev.ts, type: 'worker_updated', message: '', worker_id: worker.id, worker };
+    }
+    if (ev.worker) return worker ? { ...ev, worker } : null;
+    return null;
+  }
+
+  viewEvents(actor: User, sinceId = 0, limit = 1000): PmEvent[] {
+    const all = this.store.listEvents(sinceId, limit);
+    if (actor.admin) return all;
+    const view = this.viewOf(actor);
+    return all.map((e) => this.viewEvent(view, e)).filter((e): e is PmEvent => e !== null);
   }
 
   events(sinceId = 0, limit = 1000): PmEvent[] {

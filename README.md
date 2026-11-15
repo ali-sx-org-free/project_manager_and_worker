@@ -1,6 +1,6 @@
 # Agent PM：多 agent 項目管理原型
 
-一個 PM agent 把人類的請求拆成任務 DAG，分散在不同電腦上的 Worker agent 領取、交付，PM review 後交付。
+一個 PM agent 管理多個項目：把每個請求拆成任務 DAG，分散在不同電腦上的 Worker agent 領取、交付，PM review 後交付。
 這個倉庫是用來討論方案的可運行原型：協調服務、MCP 工具、Worker runner、3D 視窗和模擬器都能跑，但都只做到「夠討論」的程度。
 
 ![3D 總覽](docs/screenshots/01-overview.png)
@@ -13,6 +13,10 @@
 | --- | --- |
 | ![待接手](docs/screenshots/05-waiting-takeover.png) | ![接力記錄](docs/screenshots/06-handoff-log.png) |
 
+| 以同事A 的身分檢視：只看得到他參與的兩個項目 | 項目設定：優先級、並行配額、成員 |
+| --- | --- |
+| ![檢視身分](docs/screenshots/07-view-as.png) | ![項目設定](docs/screenshots/08-project-settings.png) |
+
 **想一步步驗收和上手操作，請看 [docs/TUTORIAL.md](docs/TUTORIAL.md)。**
 
 ## 一分鐘跑起來
@@ -24,7 +28,8 @@ npm install
 npm run demo        # 構建網頁，啟動協調服務 + 模擬器
 ```
 
-打開 <http://localhost:4000>。模擬器會扮演 4 台電腦上的 worker 和一個 PM，你會看到任務被領取、交付、review、解鎖下游。
+打開 <http://localhost:4000>。模擬器會扮演 4 台電腦上的 worker 和一個 PM，同時管三個項目（優先級和並行配額各不相同），你會看到任務被領取、交付、review、解鎖下游。
+右上角的「檢視身分」可以換成同事A、同事B、家人的視角，看看每個人看得到哪些項目。
 第一輪劇情是固定的，方便討論：
 
 - 「調研三款投影機」做到 40% 被人工打斷，任務帶著進度回到任務池
@@ -41,7 +46,7 @@ npm run demo        # 構建網頁，啟動協調服務 + 模擬器
 npm run dev         # 開發模式：服務 + 模擬器 + vite（http://localhost:5173，改前端即時刷新）
 npm run server      # 只啟動協調服務（真實用法，資料庫 data/pm.db，租約 30 分鐘）
 npm run sim         # 對著已啟動的服務跑模擬器
-npm test            # 狀態機 + REST + MCP + WebSocket + 續作，共 16 項測試
+npm test            # 狀態機 + REST + MCP + WebSocket + 續作 + 多項目，共 24 項測試
 ```
 
 不想啟動服務也可以：網頁連不上協調服務時（或網址加 `?demo`）會自動改成「瀏覽器內模擬」，
@@ -55,7 +60,8 @@ npm test            # 狀態機 + REST + MCP + WebSocket + 續作，共 16 項�
   人類 ── 網頁 ───────▶│  協調服務 packages/server                 │
   （看進度、批准）  WS │   Engine（狀態機，packages/core）          │
                        │   SQLite：projects / tasks / task_deps /  │
-  PM agent ── MCP ───▶│           workers / events                │
+  PM agent ── MCP ───▶│     workers / users / project_members /   │
+                       │     events                                │
   （拆解、review）     │   REST /api · WebSocket /ws · MCP /mcp    │
                        └──────────────▲───────────────────────────┘
                                       │ 全部由 worker 主動往外連
@@ -67,7 +73,7 @@ npm test            # 狀態機 + REST + MCP + WebSocket + 續作，共 16 項�
 
 | 目錄 | 內容 |
 | --- | --- |
-| `packages/core` | 任務狀態機 `Engine`、`Store` 介面、記憶體存儲、`PmApi`（本地 / HTTP 兩種實現）、模擬器。純 TypeScript，服務端和瀏覽器共用 |
+| `packages/core` | 任務狀態機 `Engine`、權限層 `Scoped`（`access.ts`）、`Store` 介面、記憶體存儲、`PmApi`（本地 / HTTP 兩種實現）、模擬器。純 TypeScript，服務端和瀏覽器共用 |
 | `packages/server` | Express + ws + better-sqlite3。`sqliteStore.ts` 是表結構，`app.ts` 是 REST 和 WebSocket，`mcp.ts` 是 MCP 工具 |
 | `packages/runner` | Worker runner：領任務、啟動本地 agent、發心跳 |
 | `packages/simulator` | 通過 REST 扮演 worker 和 PM 的假數據模擬器 |
@@ -97,6 +103,68 @@ pending ──依賴全部 done──▶ ready ──claim──▶ claimed ─�
 - **續作**：見下一節。任務回到 `ready` 時進度、檢查點和任務分支都留在任務上。
 - **事件**：每次變更寫一條事件（帶變更後的任務/worker 快照）並通過 WebSocket 推送。網頁只靠事件更新，回放也是重放這些事件。
 
+### 一個 PM 管多個項目
+
+一個 PM 同時管多個項目時，要回答三個問題：代碼怎麼放、agent 先給誰用、誰能看到什麼。
+
+**1. 所有項目共用一個倉庫，但在倉庫裡分得清**
+
+每個項目有一個短名 `key`（小寫字母、數字、連字號，例如 `site`），還在用的項目之間不能重複。靠它做兩件事：
+
+| 規則 | 形式 | 怎麼查 |
+| --- | --- | --- |
+| 分支名帶項目 | `project/<項目短名>/<任務 key>-<編號>` | `git branch -r --list 'origin/project/site/*'` |
+| commit 帶項目 | 標題以 `[site/api]` 開頭，結尾附 `Project: site`、`Task: <任務 id>`、`Worker: <worker id>` 三行 | `git log --all --grep='Project: site'` |
+
+分支名在建立項目時由協調服務定好，worker 不能自己取。commit 標記有兩道保證：runner 代提交的 commit 直接按這個格式寫；
+agent 自己的 commit 由 runner 裝在工作目錄裡的 `prepare-commit-msg` hook 自動補上（hook 只在任務執行期間生效，工作目錄已有別的同名 hook 時不覆蓋，只提醒）。
+
+**2. 優先級和並行配額**
+
+| 項目上的設定 | 含義 |
+| --- | --- |
+| `priority` | 1 到 5，越大越優先。worker 同時有多個項目的任務可領時，先領優先級高的 |
+| `max_parallel` | 並行配額：這個項目同時最多有幾個任務在執行。`null` 不限，`0` 等於暫停派工（正在做的不打斷） |
+
+`listClaimable` 先過濾再排序。過濾：項目進行中、worker 有權參與、能力標籤滿足、配額沒滿。
+排序：優先級高的在前；同優先級先還自己做到一半的；再讓正在執行的任務較少的項目先拿；最後按建立時間。
+配額檢查和領取在同一個事務裡，併發領取不會超發（有 20 個 worker 搶配額為 2 的項目的測試）。
+優先級決定「先給誰」，配額決定「最多給多少」，兩個一起用才不會讓高優先級的項目把所有 worker 吃光。
+PM 可以隨時用 `PATCH /api/projects/:id`、MCP 的 `update_project` 或網頁的列表視圖調整，下一次領取就按新的規則。
+
+worker 這邊也可以自己設限：`WORKER_PROJECTS=site,blog` 表示這台電腦只為這兩個項目幹活。
+
+**3. 按項目的權限**
+
+| 概念 | 說明 |
+| --- | --- |
+| 用戶 `users` | 一個人或一個 PM agent，各有一個 token（服務端只存雜湊）。`admin` 能看到並管理所有項目 |
+| 項目成員 `project_members` | 用戶在項目裡的角色：`manager` 負責人、`contributor` 參與者、`viewer` 觀察者 |
+| worker 的主人 `workers.owner` | worker 用誰的 token 註冊就屬於誰，只能領主人是負責人或參與者的項目的任務 |
+
+| 操作 | 需要 |
+| --- | --- |
+| 看項目、任務、事件 | 是項目成員（任何角色） |
+| worker 領取、心跳、存檢查點、交付 | 是這個 worker 的主人，且主人在項目裡是負責人或參與者 |
+| review、解除阻塞、改優先級和配額、管成員、歸檔 | 項目的負責人 |
+| 建立用戶 | 管理員 |
+| 建立項目 | 任何用戶，建立者自動成為負責人 |
+
+不是成員就完全看不到這個項目：`/api/state`、`/api/events`、WebSocket 推送、MCP 工具都按調用者的身分過濾，查看不到的任務返回「不存在」。
+worker 會跨項目幹活，所以和你有共同項目的人的 worker 你看得到，但它在你看不到的項目裡做什麼會被抹掉，只顯示「忙於其他項目」。
+規則集中在 `packages/core/src/access.ts` 的 `Scoped`，REST、MCP、瀏覽器示範模式都經過它。
+
+啟用方式：啟動服務時設 `PM_TOKEN`，它就是管理員的 token，之後所有請求（包括讀取和 WebSocket）都要帶 token。
+不設 `PM_TOKEN` 就不鑒權，所有人都是管理員，方便本機示範；這時仍然可以用「檢視身分」（`?as=<用戶 id>`）看別人的視角。
+
+已知的限制：
+
+- token 是長期有效的 Bearer token，沒有過期和輪換；用 `?token=` 打開網頁時 token 會留在網址裡。
+- 權限只管協調服務裡的數據。倉庫是共用的，有倉庫讀權限的人仍然看得到所有項目的分支。要連代碼都隔離，得回到「每個項目一個倉庫」。
+- 沒有搶佔：調高優先級不會打斷正在執行的任務，只影響下一次領取。
+- 配額只按項目算，沒有「每個人最多佔幾個 worker」或「某類任務最多幾個」。
+- 跨項目依賴還沒做。
+
 ### 斷連後接手續作
 
 agent 執行任務時隨時可能斷：網路抖動、被人打斷、usage limit、電腦睡眠或斷電。目標是別的 agent 接手時接著做，不從頭開始。
@@ -107,7 +175,7 @@ agent 執行任務時隨時可能斷：網路抖動、被人打斷、usage limit
 | --- | --- |
 | `progress` | 0 到 100 |
 | `worklog` | 只增不改的接力記錄。兩種條目：`checkpoint`（做了什麼 `summary`、接下來做什麼 `next_steps`、`progress`、`commit`、`artifacts`）和 `interrupted`（誰、什麼原因、交接說明） |
-| `branch` | 這個任務固定的 git 分支 `task/<key>-<id 後綴>`，中間成果 push 在這裡 |
+| `branch` | 這個任務固定的 git 分支 `project/<項目短名>/<任務 key>-<編號>`，中間成果 push 在這裡 |
 
 流程：
 
@@ -136,9 +204,13 @@ agent 執行任務時隨時可能斷：網路抖動、被人打斷、usage limit
 
 | 方法 | 路徑 | 用途 |
 | --- | --- | --- |
-| GET | `/api/state` | 全量快照 |
+| GET | `/api/me` | 我是誰、服務有沒有啟用鑒權 |
+| GET | `/api/state` | 快照（只含調用者看得到的項目） |
 | GET | `/api/events?since=<id>` | 事件日誌 |
-| POST | `/api/projects` | PM 建立項目（任務 DAG） |
+| POST | `/api/projects` | PM 建立項目（任務 DAG；可帶 `key`、`priority`、`max_parallel`、`members`） |
+| PATCH | `/api/projects/:id` | 調整優先級和並行配額（`:id` 可以是 id 或短名） |
+| PUT · DELETE | `/api/projects/:id/members/:userId` | 設定成員角色 · 移出成員 |
+| POST | `/api/users` | 管理員建立用戶，返回只顯示一次的 token |
 | POST | `/api/workers/register` | worker 註冊 |
 | GET | `/api/tasks/claimable?worker_id=` | 這個 worker 可領的任務 |
 | POST | `/api/tasks/claim` | 原子領取 |
@@ -150,7 +222,7 @@ agent 執行任務時隨時可能斷：網路抖動、被人打斷、usage limit
 | POST | `/api/tasks/:id/review` | 批准 / 退回 |
 | POST | `/api/tasks/:id/unblock` | 解除阻塞 |
 
-設置環境變量 `PM_TOKEN` 後，所有寫操作和 MCP 都需要 `Authorization: Bearer <token>`；網頁用 `?token=` 帶上。
+設置環境變量 `PM_TOKEN` 後啟用鑒權：所有請求（讀、寫、WebSocket、MCP）都需要 `Authorization: Bearer <token>`，每個人只看得到自己參與的項目；網頁用 `?token=` 帶上。
 
 ### MCP
 
@@ -163,7 +235,7 @@ claude mcp add --transport http agent-pm http://<協調服務地址>:4000/mcp
 | 角色 | 工具 |
 | --- | --- |
 | Worker | `register_worker` `list_ready_tasks` `claim_task` `heartbeat` `save_checkpoint` `release_task` `submit_result` `report_blocked` |
-| PM | `create_project` `list_tasks` `get_task` `review_task` `unblock_task` |
+| PM | `create_project` `list_projects` `update_project` `set_project_member` `list_tasks` `get_task` `review_task` `unblock_task` |
 
 ### Worker runner
 
@@ -184,7 +256,8 @@ agent 退出時如果沒有自己提交，runner 兜底：正常退出就用輸�
 
 | 環境變量 | 預設 | 用途 |
 | --- | --- | --- |
-| `PM_URL` · `PM_TOKEN` | `http://localhost:4000` | 協調服務地址和 token |
+| `PM_URL` · `PM_TOKEN` | `http://localhost:4000` | 協調服務地址和 token。啟用鑒權後，token 是誰的，這個 worker 就屬於誰 |
+| `WORKER_PROJECTS` | 不限 | 只為這些項目（短名，逗號分隔）幹活 |
 | `WORKER_ID` · `WORKER_NAME` · `WORKER_MACHINE` · `WORKER_LABELS` | 主機名 · 無標籤 | worker 身份和能力標籤（逗號分隔） |
 | `AGENT_CMD` | `claude -p` | 啟動 agent 的命令，提示詞作為最後一個參數 |
 | `WORK_DIR` | 啟動時所在目錄 | agent 的工作目錄 |
@@ -195,11 +268,12 @@ agent 退出時如果沒有自己提交，runner 兜底：正常退出就用輸�
 | `COOLDOWN_MS` | `600000` | 額度用完後這台電腦多久不領任務 |
 | `POLL_MS` | `5000` | 沒任務時多久問一次 |
 
-agent 進程會收到 `PM_URL`、`PM_WORKER_ID`、`PM_TASK_ID`、`PM_TASK_KEY`、`PM_TASK_BRANCH`、`PM_RESUME_PROGRESS` 這幾個環境變量。
+agent 進程會收到 `PM_URL`、`PM_WORKER_ID`、`PM_PROJECT_KEY`、`PM_TASK_ID`、`PM_TASK_KEY`、`PM_TASK_BRANCH`、`PM_RESUME_PROGRESS` 這幾個環境變量。
 
 ## 3D 視窗怎麼看
 
-- **泳道**：每個項目一塊檯面，任務按依賴從左到右分層排開。
+- **泳道**：每個項目一塊檯面，任務按依賴從左到右分層排開。優先級高的項目排在最靠近鏡頭的位置；檯面右上角標著項目短名、優先級和「並行 2/3」（現在幾個任務在執行 / 配額）。
+- **檢視身分**：右上角可以換成別人的視角，只顯示他參與的項目。
 - **節點顏色**：灰 等待依賴、藍 可領取（呼吸）、黃 執行中（旋轉環）、紫 待 review、橙 退回修改、紅 受阻（閃爍）、綠 已完成。
 - **進度環**：做到一半的任務外圈有一段環，長度是進度。執行中是狀態色，中斷後等人接手是白色並寫著「待接手 N%」。側欄裡有完整的接力記錄。
 - **光流**：任務通過 review 時，沿連線有一顆光點流向下游。
@@ -213,10 +287,14 @@ agent 進程會收到 `PM_URL`、`PM_WORKER_ID`、`PM_TASK_ID`、`PM_TASK_KEY`�
 2. **誰領取**：現在 runner 領取、agent 交付。另一種是 agent 自己通過 MCP 領取，runner 只負責喚醒。前者心跳可靠，後者 agent 可以挑任務。
 3. **人類審批節點**：現在人和 PM 用同一個 review 接口。是否需要「必須人類批准」的任務類型？
 4. **重新拆解**：項目建立後還不能增刪任務或改依賴。PM 發現拆錯了要怎麼改圖？
-5. **鑒權和身份**：現在是一個共享 token，worker 自報 id。同事的電腦用誰的帳號、能看到哪些項目還沒設計。
+5. **身份的顆粒度**：現在是每人一個長期 token、三種項目角色。要不要接現成的登入（GitHub、公司 SSO）？PM agent 用誰的身份？token 怎麼過期和輪換？
 6. **上下文傳遞**：下游任務怎麼拿到上游的交付物（PR、文件、調研結果）？現在只有任務上的 `result.summary` 和 `pr_url`。
 7. **交付物驗證**：PR 鏈接只是字符串，沒有對接 GitHub 檢查 CI 狀態或合併。
 8. **對話上下文的接力**：現在接手者只拿到檢查點的文字和 git 分支。要不要把上一位 agent 的對話記錄（或它的摘要）也存下來交給下一位？存在哪、多大、有沒有隱私問題？
 9. **檢查點的強制程度**：agent 不存檢查點時只有 runner 的自動 commit。要不要規定「超過 N 分鐘沒有檢查點就提醒或中斷」？
 10. **沒推上去的改動**：斷網的 worker 回來發現任務已被接手時，它本地多做的部分現在只是留著。要不要自動推到一個旁支，讓接手者或 PM 決定要不要合併？
 11. **usage limit 的識別**：現在靠輸出文字匹配。更可靠的做法是 agent 自己在額度快用完時調用 `release_task`，或者 runner 讀 agent 的結構化退出資訊。
+12. **跨項目依賴**：項目 A 的任務等項目 B 的某個任務完成。這次先不做。
+13. **搶佔**：緊急項目進來時，要不要讓低優先級項目的 worker 存檢查點後讓出來？現在的續作機制已經能支持「打斷後接著做」，缺的是決策規則。
+14. **更細的配額**：按人、按能力標籤、按時間段（例如家用電腦只在晚上接活）分配 agent。
+15. **倉庫層面的隔離**：共用倉庫下，項目之間只靠分支前綴和 commit 標記區分。要不要加分支保護規則（例如 `project/site/*` 只允許 site 的成員 push）？

@@ -1,6 +1,6 @@
 import type { PmApi } from './api.ts';
 import { buildResume } from './engine.ts';
-import type { ProjectInput, Task, TaskInput, WorkerInput } from './types.ts';
+import type { ProjectInput, Task, TaskInput, UserInput, WorkerInput } from './types.ts';
 
 /** 模擬器：扮演幾台電腦上的 Worker Agent 和一個 PM Agent，只通過 PmApi 與協調服務交互。
  *  同一份代碼既可以連真實服務（HTTP），也可以在瀏覽器裡直接驅動記憶體 Engine。 */
@@ -23,11 +23,20 @@ const STEPS = 5;
 const STEP_NOTES = ['讀完需求並定下做法', '完成主要部分', '補上邊界情況', '自測並修正問題', '對照驗收標準整理交付'];
 type SimTask = TaskInput & { fate?: Fate };
 
+/** 四個人。「你」是管理員，看得到全部項目；其他人只看得到自己參與的項目。 */
+export const SIM_USERS: UserInput[] = [
+  { id: 'you', name: '你', admin: true },
+  { id: 'colleague-a', name: '同事A' },
+  { id: 'colleague-b', name: '同事B' },
+  { id: 'family', name: '家人' },
+];
+
+/** 每個 worker 屬於一個人，只能領主人有權參與的項目的任務 */
 export const SIM_WORKERS: WorkerInput[] = [
-  { id: 'w-office', name: '阿工', machine: '工作電腦', labels: ['code', 'office-pc'] },
-  { id: 'w-home', name: '小家', machine: '家用電腦', labels: ['code', 'gpu', 'home-pc', 'chore'] },
-  { id: 'w-colleague-a', name: '同事A', machine: '同事A 的筆電', labels: ['code', 'design'] },
-  { id: 'w-colleague-b', name: '同事B', machine: '同事B 的電腦', labels: ['docs', 'research', 'chore'] },
+  { id: 'w-office', name: '阿工', machine: '工作電腦', labels: ['code', 'office-pc'], owner: 'you' },
+  { id: 'w-home', name: '小家', machine: '家用電腦', labels: ['code', 'gpu', 'home-pc', 'chore'], owner: 'you' },
+  { id: 'w-colleague-a', name: '同事A', machine: '同事A 的筆電', labels: ['code', 'design'], owner: 'colleague-a' },
+  { id: 'w-colleague-b', name: '同事B', machine: '同事B 的電腦', labels: ['docs', 'research', 'chore'], owner: 'colleague-b' },
 ];
 
 const DEV_TASKS: SimTask[] = [
@@ -113,6 +122,32 @@ const DEV_TASKS: SimTask[] = [
     deps: ['e2e'],
     description: '撰寫發布說明、更新文件並安排上線。',
     acceptance: '發布說明經 PM 確認；回滾步驟寫明。',
+  },
+];
+
+const PROMO_TASKS: SimTask[] = [
+  {
+    key: 'banner',
+    title: '活動主視覺',
+    labels: ['design'],
+    description: '週年慶活動的主視覺與配色。',
+    acceptance: '桌面與手機各一版；文字可替換。',
+  },
+  {
+    key: 'page',
+    title: '活動頁切版',
+    labels: ['code'],
+    deps: ['banner'],
+    description: '依主視覺完成活動頁。',
+    acceptance: '手機與桌面版面正確；圖片有壓縮。',
+  },
+  {
+    key: 'form',
+    title: '報名表單串接',
+    labels: ['code'],
+    deps: ['page'],
+    description: '報名表單送出後寫入名單並寄確認信。',
+    acceptance: '重複報名有提示；確認信內容正確。',
   },
 ];
 
@@ -205,6 +240,7 @@ export class Simulator {
   }
 
   async start() {
+    for (const u of SIM_USERS) await this.api.createUser(u);
     for (const w of SIM_WORKERS) await this.api.registerWorker(w);
     await this.newRound();
     for (const w of SIM_WORKERS) void this.workerLoop(w);
@@ -230,16 +266,42 @@ export class Simulator {
     const suffix = this.round > 1 ? `（第 ${this.round} 輪）` : '';
     const inputs: (Omit<ProjectInput, 'tasks'> & { tasks: SimTask[] })[] = [
       {
+        // 優先級最高，但最多同時佔用 3 個 worker，留一個給別的項目
+        key: 'site',
+        priority: 4,
+        max_parallel: 3,
+        members: [
+          { user_id: 'colleague-a', role: 'contributor' },
+          { user_id: 'colleague-b', role: 'contributor' },
+        ],
         title: `官網會員系統上線${suffix}`,
         kind: 'dev',
         description: '人類的請求：「幫官網加上會員登入，月底前上線。」',
         tasks: DEV_TASKS,
       },
       {
+        key: 'home',
+        priority: 3,
+        max_parallel: 2,
+        members: [
+          { user_id: 'colleague-b', role: 'contributor' },
+          { user_id: 'family', role: 'viewer' },
+        ],
         title: `本週日常雜事${suffix}`,
         kind: 'chore',
         description: '人類的請求：「這週的雜事幫我處理一下。」',
         tasks: CHORE_TASKS,
+      },
+      {
+        // 優先級最低：只有別的項目用不完的 worker 才會來做，而且一次只給一個
+        key: 'promo',
+        priority: 2,
+        max_parallel: 1,
+        members: [{ user_id: 'colleague-a', role: 'manager' }],
+        title: `週年慶活動頁${suffix}`,
+        kind: 'dev',
+        description: '人類的請求：「週年慶活動頁有空再做，不急。」',
+        tasks: PROMO_TASKS,
       },
     ];
     for (const input of inputs) {

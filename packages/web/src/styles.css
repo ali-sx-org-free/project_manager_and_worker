@@ -696,3 +696,86 @@ tbody tr:last-child td {
 .worklog .interrupted b {
   color: #ff8b98;
 }
+
+/* ── 多項目：優先級、配額、身分 ── */
+.tabs em.prio {
+  padding: 1px 6px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  font-size: 11px;
+}
+.tabs em.prio.p4,
+.tabs em.prio.p5 {
+  color: #ffd98a;
+  border-color: rgba(255, 217, 138, 0.5);
+}
+.tabs em.prio.p1,
+.tabs em.prio.p2 {
+  opacity: 0.7;
+}
+.ident {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--muted);
+  white-space: nowrap;
+}
+.ident select,
+.psettings select {
+  padding: 4px 6px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel);
+  color: var(--fg);
+  font: inherit;
+}
+.ident select:focus-visible,
+.psettings select:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+.psettings {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 16px;
+  margin: 0 0 10px;
+  padding: 8px 12px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--panel);
+  font-size: 13px;
+}
+.psettings label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--muted);
+}
+.psettings select:disabled {
+  opacity: 0.6;
+}
+.psettings .full {
+  color: #f7c948;
+}
+.psettings .members {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  color: var(--muted);
+}
+.psettings .members em {
+  font-style: normal;
+  padding: 1px 8px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  color: var(--fg);
+}
+.psettings .members small {
+  color: var(--muted);
+}
+.mode.denied i {
+  background: #ff5468;
+}
