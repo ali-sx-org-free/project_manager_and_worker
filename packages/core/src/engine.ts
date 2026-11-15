@@ -3,14 +3,54 @@ import {
   PmError,
   type EventType,
   type PmEvent,
+  type InterruptReason,
   type Project,
   type ProjectInput,
+  type ResumeContext,
   type Review,
   type Snapshot,
   type Task,
+  type WorkLogEntry,
   type Worker,
   type WorkerInput,
 } from './types.ts';
+
+const MAX_WORKLOG = 40;
+
+export const INTERRUPT_LABEL: Record<InterruptReason | 'changes_requested', string> = {
+  lease_expired: '斷線，租約超時',
+  interrupted: '被人工打斷',
+  usage_limit: '用量額度用完',
+  released: '主動釋放',
+  blocked: '受阻',
+  error: 'agent 異常退出',
+  changes_requested: 'review 退回',
+};
+
+/** 從工作日誌算出續作上下文。沒有任何檢查點時返回 null，表示這個任務要從頭做。 */
+export function buildResume(task: Task): ResumeContext | null {
+  const checkpoints = task.worklog.filter((e) => e.kind === 'checkpoint');
+  const latest = checkpoints.at(-1);
+  if (!latest) return null;
+  // agent 自己寫的總結比 runner 自動存的輸出片段有用，優先用它
+  const last = checkpoints.filter((e) => !e.auto).at(-1) ?? latest;
+  const auto = checkpoints.filter((e) => e.auto).at(-1);
+  const stop = task.worklog.at(-1)?.kind === 'interrupted' ? task.worklog.at(-1)! : null;
+  const rejected = task.state === 'changes_requested' || task.reviews.at(-1)?.decision === 'reject';
+  return {
+    from_worker: task.last_assignee ?? last.worker_id,
+    reason: stop?.reason ?? (rejected ? 'changes_requested' : null),
+    handoff_note: stop?.summary ?? null,
+    progress: task.progress,
+    summary: last.summary,
+    next_steps: last.next_steps ?? null,
+    auto_note: auto && auto !== last ? auto.summary : null,
+    branch: task.branch,
+    commit: [...checkpoints].reverse().find((e) => e.commit)?.commit ?? null,
+    artifacts: [...new Set(checkpoints.flatMap((e) => e.artifacts ?? []))],
+    checkpoints: checkpoints.length,
+  };
+}
 
 export interface EngineOptions {
   /** 租約時長：領取後超過這麼久沒有心跳，任務自動回到任務池 */
@@ -99,6 +139,20 @@ export class Engine {
     return t.labels.every((l) => w.labels.includes(l));
   }
 
+  /** 往任務的工作日誌追加一條。日誌跟著任務走，租約回收、換人都不會丟。 */
+  private log(t: Task, workerId: string, entry: Omit<WorkLogEntry, 'seq' | 'worker_id' | 'attempt' | 'at'>) {
+    const prev = t.worklog.at(-1);
+    const seq = (prev?.seq ?? 0) + 1;
+    // runner 的自動檢查點很頻繁：連續的自動檢查點只留最新一條，免得把 agent 自己寫的總結擠出日誌
+    const keep =
+      entry.auto && prev?.auto && prev.kind === 'checkpoint' && prev.worker_id === workerId && prev.attempt === t.attempt
+        ? t.worklog.slice(0, -1)
+        : t.worklog;
+    t.worklog = [...keep, { seq, worker_id: workerId, attempt: t.attempt, at: this.nowFn(), ...entry }].slice(
+      -MAX_WORKLOG,
+    );
+  }
+
   private freeWorker(workerId: string | null, offline = false) {
     if (!workerId) return;
     const w = this.store.getWorker(workerId);
@@ -176,6 +230,9 @@ export class Engine {
         result: null,
         reviews: [],
         blocked_reason: null,
+        worklog: [],
+        progress: 0,
+        branch: `task/${t.key}-${idOf.get(t.key)!.slice(-4)}`,
         created_at: now,
         updated_at: now,
       }));
@@ -246,9 +303,16 @@ export class Engine {
           this.canDo(w, t),
       )
       .sort((a, b) => {
-        // 被退回的任務優先還給原來的人
-        const mine = (t: Task) => (t.state === 'changes_requested' && t.last_assignee === w.id ? 0 : 1);
-        return mine(a) - mine(b) || a.created_at - b.created_at;
+        // 自己做到一半的（被退回、斷線後回來）優先還給自己，上下文最完整；
+        // 但自己剛因為額度用完或被人打斷而交出去的排到最後，留給別人接手
+        const rank = (t: Task) => {
+          if (t.last_assignee !== w.id) return 1;
+          const stop = t.worklog.at(-1);
+          const handedOff =
+            stop?.kind === 'interrupted' && (stop.reason === 'usage_limit' || stop.reason === 'interrupted');
+          return handedOff ? 2 : 0;
+        };
+        return rank(a) - rank(b) || a.created_at - b.created_at;
       });
   }
 
@@ -281,7 +345,15 @@ export class Engine {
         if (!this.store.casTask(next, ['ready', 'changes_requested'])) continue; // 被別人搶先
         w.current_task = next.id;
         this.store.upsertWorker(w);
-        this.emit('task_claimed', `${w.name} 領取「${next.title}」`, {
+        // 有檢查點就是「接手續作」，而不是從頭領取
+        const resume = buildResume(c);
+        const prev = resume?.from_worker ? (this.store.getWorker(resume.from_worker)?.name ?? resume.from_worker) : null;
+        const message = !resume
+          ? `${w.name} 領取「${next.title}」`
+          : prev && resume.from_worker !== w.id
+            ? `${w.name} 接手「${next.title}」，從 ${resume.progress}% 繼續（上一位 ${prev}：${resume.reason ? INTERRUPT_LABEL[resume.reason] : '已停下'}）`
+            : `${w.name} 回來繼續「${next.title}」，從 ${resume.progress}% 接著做`;
+        this.emit(resume ? 'task_resumed' : 'task_claimed', message, {
           project_id: next.project_id,
           task_id: next.id,
           worker_id: w.id,
@@ -314,6 +386,51 @@ export class Engine {
     });
   }
 
+  /** 保存檢查點：把「做到哪、接下來做什麼、中間成果在哪」記到任務上，同時續約。
+   *  之後不管因為什麼原因換人，接手的 worker 領取時都會拿到最後一個檢查點。 */
+  saveCheckpoint(
+    workerId: string,
+    taskId: string,
+    cp: {
+      summary: string;
+      next_steps?: string;
+      progress?: number;
+      commit?: string;
+      artifacts?: string[];
+      auto?: boolean;
+    },
+  ): { seq: number; lease_expires_at: number } {
+    if (!cp?.summary?.trim()) throw new PmError('invalid', '檢查點需要 summary：到目前為止完成了什麼');
+    return this.run(() => {
+      const { w, t } = this.mustHold(workerId, taskId);
+      const progress =
+        cp.progress === undefined || Number.isNaN(Number(cp.progress))
+          ? t.progress
+          : Math.max(0, Math.min(100, Math.round(Number(cp.progress))));
+      this.log(t, w.id, {
+        kind: 'checkpoint',
+        summary: cp.summary.trim().slice(0, 4000),
+        next_steps: cp.next_steps?.trim().slice(0, 2000) || undefined,
+        progress,
+        commit: cp.commit || undefined,
+        artifacts: cp.artifacts?.length ? cp.artifacts.slice(0, 20) : undefined,
+        auto: cp.auto || undefined,
+      });
+      t.progress = progress;
+      t.lease_expires_at = this.nowFn() + this.leaseMs;
+      t.updated_at = this.nowFn();
+      this.store.updateTask(t);
+      this.emit('task_checkpoint', `${w.name} 保存檢查點「${t.title}」${progress}%：${cp.summary.trim().slice(0, 60)}`, {
+        project_id: t.project_id,
+        task_id: t.id,
+        worker_id: w.id,
+        task: t,
+        worker: w,
+      });
+      return { seq: t.worklog.at(-1)!.seq, lease_expires_at: t.lease_expires_at };
+    });
+  }
+
   private mustHold(workerId: string, taskId: string) {
     const w = this.touch(this.mustWorker(workerId));
     const t = this.mustTask(taskId);
@@ -328,6 +445,7 @@ export class Engine {
       const { w, t } = this.mustHold(workerId, taskId);
       const now = this.nowFn();
       t.state = 'in_review';
+      t.progress = 100;
       t.result = {
         summary: result.summary ?? '',
         pr_url: result.pr_url || undefined,
@@ -356,6 +474,7 @@ export class Engine {
       const { w, t } = this.mustHold(workerId, taskId);
       t.state = 'blocked';
       t.blocked_reason = reason || '未說明原因';
+      this.log(t, w.id, { kind: 'interrupted', reason: 'blocked', summary: t.blocked_reason });
       t.assignee = null;
       t.last_assignee = w.id;
       t.lease_expires_at = null;
@@ -373,10 +492,17 @@ export class Engine {
     });
   }
 
-  /** worker 主動放棄，任務回到任務池 */
-  releaseTask(workerId: string, taskId: string): Task {
+  /** worker 交出任務（人工打斷、額度用完、主動放棄），任務立刻回到任務池，不用等租約超時。
+   *  note 是寫給接手者的交接說明。 */
+  releaseTask(workerId: string, taskId: string, opts: { reason?: InterruptReason; note?: string } = {}): Task {
     return this.run(() => {
       const { w, t } = this.mustHold(workerId, taskId);
+      const reason = opts.reason ?? 'released';
+      this.log(t, w.id, {
+        kind: 'interrupted',
+        reason,
+        summary: opts.note?.trim().slice(0, 2000) || INTERRUPT_LABEL[reason],
+      });
       t.state = 'ready';
       t.assignee = null;
       t.last_assignee = w.id;
@@ -384,7 +510,7 @@ export class Engine {
       t.updated_at = this.nowFn();
       this.store.updateTask(t);
       const freed = this.freeWorker(w.id);
-      this.emit('task_released', `${w.name} 釋放「${t.title}」`, {
+      this.emit('task_released', `${w.name} 交出「${t.title}」（${INTERRUPT_LABEL[reason]}），已完成 ${t.progress}%，等待接手`, {
         project_id: t.project_id,
         task_id: t.id,
         worker_id: w.id,
@@ -433,6 +559,7 @@ export class Engine {
 
       if (r.decision === 'reject') {
         t.state = 'changes_requested';
+        t.progress = Math.min(t.progress, 80);
         this.store.updateTask(t);
         this.emit('review_rejected', `${review.reviewer} 退回「${t.title}」：${review.comment || '需要修改'}`, {
           project_id: t.project_id,
@@ -489,6 +616,7 @@ export class Engine {
       for (const t of this.store.listTasks()) {
         if (t.state !== 'claimed' || t.lease_expires_at === null || t.lease_expires_at > now) continue;
         const holder = t.assignee;
+        if (holder) this.log(t, holder, { kind: 'interrupted', reason: 'lease_expired', summary: '心跳中斷，租約超時' });
         const next: Task = {
           ...t,
           state: 'ready',
@@ -499,13 +627,17 @@ export class Engine {
         };
         if (!this.store.casTask(next, ['claimed'])) continue;
         const w = this.freeWorker(holder, true);
-        this.emit('lease_expired', `「${t.title}」租約超時（${w?.name ?? holder} 失聯），回到任務池`, {
-          project_id: t.project_id,
-          task_id: t.id,
-          worker_id: holder ?? undefined,
-          task: next,
-          worker: w,
-        });
+        this.emit(
+          'lease_expired',
+          `「${t.title}」租約超時（${w?.name ?? holder} 失聯），回到任務池${t.worklog.some((e) => e.kind === 'checkpoint') ? `，保留 ${t.progress}% 的進度` : ''}`,
+          {
+            project_id: t.project_id,
+            task_id: t.id,
+            worker_id: holder ?? undefined,
+            task: next,
+            worker: w,
+          },
+        );
       }
       for (const w of this.store.listWorkers()) {
         if (w.status === 'online' && !w.current_task && now - w.last_seen > this.leaseMs * 2) {

@@ -82,11 +82,28 @@ export function createServer(opts: ServerOptions) {
       }),
     ),
   );
+  app.post('/api/tasks/:id/checkpoint', (req, res) =>
+    res.json(
+      engine.saveCheckpoint(str(req.body?.worker_id, 'worker_id'), id(req), {
+        summary: req.body?.summary ?? '',
+        next_steps: req.body?.next_steps,
+        progress: req.body?.progress,
+        commit: req.body?.commit,
+        artifacts: req.body?.artifacts,
+        auto: req.body?.auto === true,
+      }),
+    ),
+  );
   app.post('/api/tasks/:id/block', (req, res) =>
     res.json(engine.reportBlocked(str(req.body?.worker_id, 'worker_id'), id(req), req.body?.reason ?? '')),
   );
   app.post('/api/tasks/:id/release', (req, res) =>
-    res.json(engine.releaseTask(str(req.body?.worker_id, 'worker_id'), id(req))),
+    res.json(
+      engine.releaseTask(str(req.body?.worker_id, 'worker_id'), id(req), {
+        reason: req.body?.reason,
+        note: req.body?.note,
+      }),
+    ),
   );
 
   // ── MCP（無狀態 Streamable HTTP）──

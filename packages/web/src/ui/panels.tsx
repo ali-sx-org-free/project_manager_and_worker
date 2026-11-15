@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { TASK_STATES, type Task, type TaskState } from '@agent-pm/core';
+import { INTERRUPT_LABEL, TASK_STATES, type Task, type TaskState } from '@agent-pm/core';
 import { backend } from '../backend.ts';
 import { sortedProjects, useStore, useWorld, type World } from '../store.ts';
 import { EVENT_COLOR, STATE_META, WORKER_COLORS, fmtTime } from '../theme.ts';
@@ -116,7 +116,11 @@ export function Feed() {
   const events = useStore((s) => s.events);
   const replayIdx = useStore((s) => s.replayIdx);
   const set = useStore((s) => s.set);
-  const shown = (replayIdx === null ? events : events.slice(0, replayIdx)).slice(-7).reverse();
+  // 檢查點很頻繁，放進動態會把別的事件沖掉；它們在任務側欄的「接力記錄」裡
+  const shown = (replayIdx === null ? events : events.slice(0, replayIdx))
+    .filter((e) => e.type !== 'task_checkpoint')
+    .slice(-7)
+    .reverse();
   return (
     <aside className="feed" aria-label="動態">
       <h3>動態</h3>
@@ -216,7 +220,15 @@ export function SidePanel() {
       </span>
     );
   };
-  const history = (replayIdx === null ? events : events.slice(0, replayIdx)).filter((e) => e.task_id === task.id).slice(-8);
+  const history = (replayIdx === null ? events : events.slice(0, replayIdx))
+    .filter((e) => e.task_id === task.id && e.type !== 'task_checkpoint')
+    .slice(-8);
+  const name = (id: string) => workers.find((w) => w.id === id)?.name ?? id;
+  const dot = (id: string) => {
+    const i = workers.findIndex((w) => w.id === id);
+    return i < 0 ? '#8b98b5' : WORKER_COLORS[i % WORKER_COLORS.length];
+  };
+  const hands = new Set(task.worklog.map((e) => e.worker_id)).size;
   const replaying = replayIdx !== null;
 
   const act = async (fn: () => Promise<unknown>) => {
@@ -276,6 +288,19 @@ export function SidePanel() {
             </div>
           )}
         </dd>
+        {(task.progress > 0 || task.worklog.length > 0) && (
+          <>
+            <dt>進度</dt>
+            <dd>
+              <div className="progress" role="progressbar" aria-valuenow={task.progress} aria-valuemin={0} aria-valuemax={100}>
+                <i style={{ width: `${task.progress}%` }} />
+              </div>
+              <span className="muted">
+                {task.progress}% · 分支 <code>{task.branch}</code>
+              </span>
+            </dd>
+          </>
+        )}
         {task.blocked_reason && (
           <>
             <dt>受阻原因</dt>
@@ -350,6 +375,35 @@ export function SidePanel() {
       )}
       {error && <p className="warn">{error}</p>}
 
+      {task.worklog.length > 0 && (
+        <>
+          <h3>接力記錄{hands > 1 ? ` · 經過 ${hands} 個 worker` : ''}</h3>
+          <ol className="worklog">
+            {task.worklog.map((e) => (
+              <li key={e.seq} className={e.kind}>
+                <i style={{ background: dot(e.worker_id) }} />
+                <div>
+                  <b>
+                    {name(e.worker_id)}
+                    {e.kind === 'checkpoint'
+                      ? ` · ${e.auto ? '自動檢查點' : '檢查點'}${e.progress !== undefined ? ` ${e.progress}%` : ''}`
+                      : ` · 中斷：${INTERRUPT_LABEL[e.reason ?? 'released']}`}
+                  </b>
+                  <time>{fmtTime(e.at)}</time>
+                  <p>{e.summary}</p>
+                  {e.next_steps && <p className="muted">接下來：{e.next_steps}</p>}
+                  {e.commit && (
+                    <p className="muted">
+                      commit <code>{e.commit}</code>
+                    </p>
+                  )}
+                </div>
+              </li>
+            ))}
+          </ol>
+        </>
+      )}
+
       <h3>這個任務的經過</h3>
       <ul className="history">
         {history.length === 0 && <li className="muted">還沒有事件</li>}
@@ -418,6 +472,7 @@ export function ListView() {
                     <th>狀態</th>
                     <th>能力標籤</th>
                     <th>執行者</th>
+                    <th className="num">進度</th>
                     <th>依賴</th>
                     <th className="num">領取次數</th>
                     <th>交付</th>
@@ -426,7 +481,7 @@ export function ListView() {
                 <tbody>
                   {tasks.length === 0 && (
                     <tr>
-                      <td colSpan={7} className="muted">
+                      <td colSpan={8} className="muted">
                         沒有符合篩選的任務
                       </td>
                     </tr>
@@ -447,6 +502,7 @@ export function ListView() {
                         </div>
                       </td>
                       <td>{name(t.assignee ?? t.result?.submitted_by ?? null) || '—'}</td>
+                      <td className="num">{t.progress > 0 ? `${t.progress}%` : '—'}</td>
                       <td className="muted">{t.deps.map((d) => world.tasks[d]?.title ?? d).join('、') || '—'}</td>
                       <td className="num">{t.attempt}</td>
                       <td>

@@ -1,5 +1,8 @@
 import assert from 'node:assert/strict';
 import type { AddressInfo } from 'node:net';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { after, before, test } from 'node:test';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
@@ -107,4 +110,63 @@ test('MCP + WebSocket：PM 拆解、worker 領取交付、PM review，事件實�
   }
   await client.close();
   ws.close();
+});
+
+test('續作：檢查點經 MCP 保存，交接後另一個 worker 領取時拿到 resume；協調服務重啟也不丟', async () => {
+  const dbFile = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'agent-pm-')), 'pm.db');
+  const start = async () => {
+    const s = createServer({ dbFile, leaseMs: 60_000 });
+    await new Promise<void>((r) => s.server.listen(0, r));
+    const url = `http://localhost:${(s.server.address() as AddressInfo).port}`;
+    const client = new Client({ name: 'test', version: '0' });
+    await client.connect(new StreamableHTTPClientTransport(new URL(url + '/mcp')));
+    const call = async (name: string, args: Record<string, unknown>) => {
+      const res = (await client.callTool({ name, arguments: args })) as {
+        isError?: boolean;
+        content: { type: string; text: string }[];
+      };
+      if (res.isError) throw new Error(res.content[0].text);
+      return JSON.parse(res.content[0].text);
+    };
+    return { s, client, call };
+  };
+
+  let run = await start();
+  await run.call('create_project', { title: '續作', tasks: [{ key: 'a', title: '長任務' }] });
+  await run.call('register_worker', { worker_id: 'first', name: '先手' });
+  await run.call('register_worker', { worker_id: 'second', name: '後手' });
+  const first = await run.call('claim_task', { worker_id: 'first' });
+  assert.equal(first.resume, null);
+  await run.call('save_checkpoint', {
+    worker_id: 'first',
+    task_id: first.task.id,
+    summary: '完成前三步',
+    next_steps: '從第四步開始',
+    progress: 60,
+    commit: 'deadbeef',
+  });
+  await run.call('release_task', {
+    worker_id: 'first',
+    task_id: first.task.id,
+    reason: 'usage_limit',
+    note: '額度用完',
+  });
+
+  // 協調服務重啟：檢查點存在 SQLite 裡
+  await run.client.close();
+  await run.s.close();
+  run = await start();
+
+  const second = await run.call('claim_task', { worker_id: 'second' });
+  assert.equal(second.task.id, first.task.id);
+  assert.equal(second.task.attempt, 2);
+  assert.equal(second.resume.progress, 60);
+  assert.equal(second.resume.summary, '完成前三步');
+  assert.equal(second.resume.next_steps, '從第四步開始');
+  assert.equal(second.resume.commit, 'deadbeef');
+  assert.equal(second.resume.reason, 'usage_limit');
+  assert.equal(second.resume.from_worker, 'first');
+  assert.equal(second.resume.branch, first.task.branch);
+  await run.client.close();
+  await run.s.close();
 });

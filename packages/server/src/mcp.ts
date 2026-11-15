@@ -2,11 +2,12 @@ import type { Request, Response } from 'express';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { z } from 'zod';
-import { PmError, type Engine, type Task } from '@agent-pm/core';
+import { PmError, buildResume, type Engine, type Task } from '@agent-pm/core';
 
 /** 把協調服務暴露成 MCP 工具。Agent 只要配置一行 MCP 地址就能領任務、交付、review。
  *
- *  Worker 用：register_worker / list_ready_tasks / claim_task / heartbeat / submit_result / report_blocked
+ *  Worker 用：register_worker / list_ready_tasks / claim_task / heartbeat / save_checkpoint /
+ *             submit_result / release_task / report_blocked
  *  PM 用：    create_project / list_tasks / get_task / review_task / unblock_task
  */
 
@@ -19,6 +20,8 @@ const brief = (t: Task) => ({
   deps: t.deps,
   assignee: t.assignee,
   attempt: t.attempt,
+  progress: t.progress,
+  branch: t.branch,
 });
 
 function buildServer(engine: Engine) {
@@ -76,7 +79,7 @@ function buildServer(engine: Engine) {
     'claim_task',
     {
       description:
-        '原子領取一個任務並取得租約。不傳 task_id 會自動挑一個適合的。返回任務詳情（含驗收標準、之前的 review 意見）；沒有可領的任務時返回 null。領取後必須定期調用 heartbeat，否則租約過期任務會被收回。',
+        '原子領取一個任務並取得租約。不傳 task_id 會自動挑一個適合的。返回任務詳情（含驗收標準、之前的 review 意見）；沒有可領的任務時返回 null。領取後必須定期調用 heartbeat，否則租約過期任務會被收回。如果返回的 resume 不是 null，表示這個任務別人（或你自己）已經做了一部分：請先讀 resume 裡的 summary、next_steps，切到 branch 分支拿到已有的中間成果，從那裡接著做，不要從頭開始。',
       inputSchema: {
         worker_id: z.string(),
         task_id: z.string().optional().describe('指定要領取的任務；省略則自動挑選'),
@@ -84,7 +87,14 @@ function buildServer(engine: Engine) {
     },
     guard(({ worker_id, task_id }) => {
       const task = engine.claimTask(worker_id, task_id);
-      return task ? { task, lease_ms: engine.leaseMs, heartbeat_every_ms: Math.floor(engine.leaseMs / 3) } : null;
+      return task
+        ? {
+            task,
+            resume: buildResume(task),
+            lease_ms: engine.leaseMs,
+            heartbeat_every_ms: Math.floor(engine.leaseMs / 3),
+          }
+        : null;
     }),
   );
 
@@ -95,6 +105,39 @@ function buildServer(engine: Engine) {
       inputSchema: { worker_id: z.string(), task_id: z.string() },
     },
     guard(({ worker_id, task_id }) => engine.heartbeat(worker_id, task_id)),
+  );
+
+  server.registerTool(
+    'save_checkpoint',
+    {
+      description:
+        '保存檢查點（同時續約）。每完成一個有意義的小步驟就調用一次：寫清楚到目前為止完成了什麼、接下來要做什麼，代碼先 commit 並 push 到任務分支再把 commit 填上。你隨時可能斷線、被打斷或用完額度，接手的 agent 只能看到最後一個檢查點，所以要寫到「換一個人照著就能接著做」的程度。',
+      inputSchema: {
+        worker_id: z.string(),
+        task_id: z.string(),
+        summary: z.string().describe('到目前為止完成了什麼'),
+        next_steps: z.string().optional().describe('接下來要做什麼，寫給接手的人看'),
+        progress: z.number().min(0).max(100).optional().describe('完成百分比'),
+        commit: z.string().optional().describe('已 push 到任務分支的 commit'),
+        artifacts: z.array(z.string()).optional().describe('其他中間產物的鏈接或路徑'),
+      },
+    },
+    guard(({ worker_id, task_id, ...cp }) => engine.saveCheckpoint(worker_id, task_id, cp)),
+  );
+
+  server.registerTool(
+    'release_task',
+    {
+      description:
+        '主動交出任務，讓別的 worker 立刻接手（不用等租約超時）。在你無法繼續但任務本身沒有問題時使用，例如用量額度快用完、被要求停下。交出前先 save_checkpoint，note 裡寫交接說明。',
+      inputSchema: {
+        worker_id: z.string(),
+        task_id: z.string(),
+        reason: z.enum(['usage_limit', 'interrupted', 'released', 'error']).optional(),
+        note: z.string().optional().describe('給接手者的交接說明'),
+      },
+    },
+    guard(({ worker_id, task_id, reason, note }) => brief(engine.releaseTask(worker_id, task_id, { reason, note }))),
   );
 
   server.registerTool(

@@ -645,3 +645,54 @@ tbody tr:last-child td {
 .history li.muted {
   display: block;
 }
+
+/* ── 進度與接力記錄 ── */
+.progress {
+  height: 6px;
+  margin: 4px 0;
+  border-radius: 3px;
+  background: #18233b;
+  overflow: hidden;
+}
+.progress i {
+  display: block;
+  height: 100%;
+  border-radius: 3px;
+  background: var(--accent);
+  transition: width 0.4s;
+}
+.worklog {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 8px;
+}
+.worklog li {
+  display: grid;
+  grid-template-columns: 8px 1fr;
+  gap: 9px;
+  font-size: 12px;
+}
+.worklog li > i {
+  width: 8px;
+  height: 8px;
+  margin-top: 5px;
+  border-radius: 50%;
+}
+.worklog b {
+  font-weight: 600;
+}
+.worklog time {
+  margin-left: 8px;
+  color: var(--muted);
+  font: 11px var(--font-display);
+  font-variant-numeric: tabular-nums;
+}
+.worklog p {
+  margin: 1px 0 0;
+  overflow-wrap: anywhere;
+}
+.worklog .interrupted b {
+  color: #ff8b98;
+}

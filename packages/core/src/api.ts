@@ -1,6 +1,7 @@
 import type { Engine } from './engine.ts';
 import {
   PmError,
+  type InterruptReason,
   type PmEvent,
   type Project,
   type ProjectInput,
@@ -21,14 +22,24 @@ export interface PmApi {
   claimTask(workerId: string, taskId?: string): Promise<Task | null>;
   heartbeat(workerId: string, taskId: string): Promise<{ lease_expires_at: number }>;
   submitResult(workerId: string, taskId: string, result: { summary: string; pr_url?: string }): Promise<Task>;
+  saveCheckpoint(workerId: string, taskId: string, cp: CheckpointInput): Promise<{ seq: number; lease_expires_at: number }>;
   reportBlocked(workerId: string, taskId: string, reason: string): Promise<Task>;
-  releaseTask(workerId: string, taskId: string): Promise<Task>;
+  releaseTask(workerId: string, taskId: string, opts?: { reason?: InterruptReason; note?: string }): Promise<Task>;
   unblock(taskId: string, by?: string): Promise<Task>;
   review(
     taskId: string,
     r: { reviewer?: string; decision: 'approve' | 'reject'; comment?: string },
   ): Promise<Task>;
   getTask(id: string): Promise<Task>;
+}
+
+export interface CheckpointInput {
+  summary: string;
+  next_steps?: string;
+  progress?: number;
+  commit?: string;
+  artifacts?: string[];
+  auto?: boolean;
 }
 
 /** 直接調用同進程內的 Engine（瀏覽器示範模式、測試） */
@@ -50,7 +61,10 @@ export function localApi(engine: Engine): PmApi {
       engine.submitResult(w, t, r),
     ),
     reportBlocked: wrap((w: string, t: string, reason: string) => engine.reportBlocked(w, t, reason)),
-    releaseTask: wrap((w: string, t: string) => engine.releaseTask(w, t)),
+    saveCheckpoint: wrap((w: string, t: string, cp: CheckpointInput) => engine.saveCheckpoint(w, t, cp)),
+    releaseTask: wrap((w: string, t: string, opts?: { reason?: InterruptReason; note?: string }) =>
+      engine.releaseTask(w, t, opts),
+    ),
     unblock: wrap((t: string, by?: string) => engine.unblock(t, by)),
     review: wrap((t: string, r: { reviewer?: string; decision: 'approve' | 'reject'; comment?: string }) =>
       engine.review(t, r),
@@ -92,7 +106,10 @@ export function httpApi(baseUrl: string, token?: string): PmApi {
       call('POST', `/api/tasks/${enc(taskId)}/submit`, { worker_id: workerId, ...result }),
     reportBlocked: (workerId, taskId, reason) =>
       call('POST', `/api/tasks/${enc(taskId)}/block`, { worker_id: workerId, reason }),
-    releaseTask: (workerId, taskId) => call('POST', `/api/tasks/${enc(taskId)}/release`, { worker_id: workerId }),
+    saveCheckpoint: (workerId, taskId, cp) =>
+      call('POST', `/api/tasks/${enc(taskId)}/checkpoint`, { worker_id: workerId, ...cp }),
+    releaseTask: (workerId, taskId, opts) =>
+      call('POST', `/api/tasks/${enc(taskId)}/release`, { worker_id: workerId, ...opts }),
     unblock: (taskId, by) => call('POST', `/api/tasks/${enc(taskId)}/unblock`, { by }),
     review: (taskId, r) => call('POST', `/api/tasks/${enc(taskId)}/review`, r),
     getTask: (id) => call('GET', `/api/tasks/${enc(id)}`),

@@ -1,0 +1,13 @@
+{
+  "title": "接力練習：寫一份五章的文件",
+  "kind": "chore",
+  "description": "用假 agent 驗收「斷連後接手續作」：文件一章一章寫，換人後接著寫。",
+  "tasks": [
+    {
+      "key": "doc",
+      "title": "寫一份五章的文件",
+      "description": "在 work/doc.md 裡寫五章，每章註明是誰寫的。",
+      "acceptance": "五章齊全，每章只出現一次。"
+    }
+  ]
+}

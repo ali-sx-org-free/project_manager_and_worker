@@ -55,6 +55,57 @@ export interface Review {
   at: number;
 }
 
+/** 任務為什麼從一個 worker 手上離開 */
+export type InterruptReason =
+  | 'lease_expired' // 心跳中斷（斷網、關機、進程被殺），租約超時後被服務收回
+  | 'interrupted' // 人工打斷（例如在 runner 上按 Ctrl+C）
+  | 'usage_limit' // agent 用量額度用完
+  | 'released' // worker 主動放棄
+  | 'blocked' // 受阻，等人解決
+  | 'error'; // agent 異常退出
+
+/** 工作日誌的一條記錄。日誌只追加、跟著任務走，不隨租約回收而消失，接手的 worker 靠它續作。 */
+export interface WorkLogEntry {
+  seq: number;
+  kind: 'checkpoint' | 'interrupted';
+  worker_id: string;
+  /** 第幾次領取期間寫下的 */
+  attempt: number;
+  at: number;
+  /** checkpoint：到目前為止完成了什麼；interrupted：交接說明 */
+  summary: string;
+  /** 接下來要做什麼（寫給接手的人看） */
+  next_steps?: string;
+  /** 0 到 100 */
+  progress?: number;
+  /** 已推送到任務分支的 commit */
+  commit?: string;
+  /** 其他中間產物的鏈接或路徑 */
+  artifacts?: string[];
+  reason?: InterruptReason;
+  /** runner 定時自動存的檢查點（只有中間成果的 commit 和輸出片段），不是 agent 自己寫的總結 */
+  auto?: boolean;
+}
+
+/** 領取任務時附帶的續作上下文：有檢查點就從檢查點接著做，而不是從頭開始 */
+export interface ResumeContext {
+  /** 上一位執行者 */
+  from_worker: string | null;
+  /** 上一位為什麼停下 */
+  reason: InterruptReason | 'changes_requested' | null;
+  handoff_note: string | null;
+  progress: number;
+  /** agent 自己寫的最後一個檢查點（沒有的話退而用 runner 自動存的） */
+  summary: string;
+  next_steps: string | null;
+  /** runner 最後一次自動檢查點記下的 agent 輸出片段 */
+  auto_note: string | null;
+  branch: string;
+  commit: string | null;
+  artifacts: string[];
+  checkpoints: number;
+}
+
 export interface Task {
   id: string;
   project_id: string;
@@ -77,6 +128,12 @@ export interface Task {
   result: TaskResult | null;
   reviews: Review[];
   blocked_reason: string | null;
+  /** 工作日誌：檢查點和中斷記錄 */
+  worklog: WorkLogEntry[];
+  /** 最近一個檢查點回報的進度，0 到 100 */
+  progress: number;
+  /** 這個任務專用的 git 分支。中間成果推到這裡，換人也是同一個分支 */
+  branch: string;
   created_at: number;
   updated_at: number;
 }
@@ -99,6 +156,8 @@ export type EventType =
   | 'project_archived'
   | 'task_ready'
   | 'task_claimed'
+  | 'task_resumed'
+  | 'task_checkpoint'
   | 'task_submitted'
   | 'task_released'
   | 'task_blocked'

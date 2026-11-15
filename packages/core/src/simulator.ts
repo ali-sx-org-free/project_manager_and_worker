@@ -1,4 +1,5 @@
 import type { PmApi } from './api.ts';
+import { buildResume } from './engine.ts';
 import type { ProjectInput, Task, TaskInput, WorkerInput } from './types.ts';
 
 /** 模擬器：扮演幾台電腦上的 Worker Agent 和一個 PM Agent，只通過 PmApi 與協調服務交互。
@@ -16,7 +17,10 @@ export interface SimOptions {
   log?: (msg: string) => void;
 }
 
-type Fate = 'crash' | 'block' | 'reject';
+type Fate = 'crash' | 'block' | 'reject' | 'usage_limit' | 'interrupt';
+
+const STEPS = 5;
+const STEP_NOTES = ['讀完需求並定下做法', '完成主要部分', '補上邊界情況', '自測並修正問題', '對照驗收標準整理交付'];
 type SimTask = TaskInput & { fate?: Fate };
 
 export const SIM_WORKERS: WorkerInput[] = [
@@ -65,6 +69,7 @@ const DEV_TASKS: SimTask[] = [
     title: '登入 / 註冊 API',
     labels: ['code'],
     deps: ['schema'],
+    fate: 'usage_limit',
     description: '實作 email + 密碼的註冊、登入、登出。',
     acceptance: '單元測試覆蓋成功與失敗路徑；密碼以 argon2 雜湊。',
   },
@@ -131,6 +136,7 @@ const CHORE_TASKS: SimTask[] = [
     key: 'projector',
     title: '調研三款投影機',
     labels: ['research'],
+    fate: 'interrupt',
     description: '預算兩萬以內，客廳使用。',
     acceptance: '列出亮度、噪音、價格與購買鏈接。',
   },
@@ -252,12 +258,14 @@ export class Simulator {
   private decideFate(task: Task): Fate | 'ok' {
     if (task.attempt === 1) {
       const scripted = this.fates.get(task.id);
-      if (scripted === 'crash' || scripted === 'block') return scripted;
+      if (scripted && scripted !== 'reject') return scripted;
     }
     const r = this.rand();
     if (task.attempt === 1 && this.round > 1) {
       if (r < 0.05) return 'crash';
       if (r < 0.09) return 'block';
+      if (r < 0.13) return 'usage_limit';
+      if (r < 0.16) return 'interrupt';
     }
     return 'ok';
   }
@@ -278,22 +286,34 @@ export class Simulator {
         continue;
       }
       if (!task) continue;
-      this.log(`${w.name} 領取「${task.title}」`);
 
+      // 每個任務分成 STEPS 步，每做完一步保存一個檢查點。
+      // 接手別人（或自己之前）做到一半的任務時，從最後一個檢查點的下一步開始，而不是從第 1 步重來。
+      const resume = buildResume(task);
+      const done = resume ? Math.min(STEPS - 1, Math.floor((resume.progress / 100) * STEPS)) : 0;
+      this.log(
+        resume ? `${w.name} 接手「${task.title}」，從第 ${done + 1}/${STEPS} 步繼續` : `${w.name} 領取「${task.title}」`,
+      );
+      const isDev = task.labels.includes('code') || task.labels.includes('design');
       const fate = this.decideFate(task);
-      const duration = this.between(5000, 10000);
-      const hbEvery = Math.max(400, (this.opts.leaseMs * this.speed) / 3);
-      const stopAt = fate === 'ok' ? duration : duration * 0.5;
-      let elapsed = 0;
+      // 出狀況的那一步：做到一半左右
+      const stopAfter = fate === 'ok' ? STEPS : Math.max(done + 1, fate === 'usage_limit' ? 3 : 2);
+      const stepMs = this.between(1000, 2000);
       let lost = false;
-      while (elapsed < stopAt && !this.stopped) {
-        const step = Math.min(hbEvery, stopAt - elapsed);
-        await this.sleep(step);
-        elapsed += step;
+      let step = done;
+      while (step < stopAfter && !this.stopped) {
+        await this.sleep(stepMs);
+        step++;
+        if (step === STEPS) break; // 最後一步做完直接提交
         try {
-          await this.api.heartbeat(w.id, task.id);
+          await this.api.saveCheckpoint(w.id, task.id, {
+            summary: `完成第 ${step}/${STEPS} 步：${STEP_NOTES[step - 1]}`,
+            next_steps: `第 ${step + 1} 步：${STEP_NOTES[step]}`,
+            progress: Math.round((step / STEPS) * 100),
+            commit: isDev ? Math.floor(this.rand() * 0xfffffff).toString(16).padStart(7, '0') : undefined,
+          });
         } catch {
-          lost = true;
+          lost = true; // 租約已經不是我的了，立刻停手
           break;
         }
       }
@@ -301,15 +321,30 @@ export class Simulator {
 
       try {
         if (fate === 'crash') {
-          // 模擬電腦關機：不再心跳，等租約過期後才重新上線
+          // 模擬電腦關機或斷網：不再心跳，等租約過期後才重新上線
           this.log(`${w.name} 的電腦斷線了`);
           await this.sleep(this.opts.leaseMs * this.speed + this.between(3000, 5000));
           await this.api.registerWorker(w);
         } else if (fate === 'block') {
           await this.api.reportBlocked(w.id, task.id, this.pick(BLOCK_REASONS));
           this.log(`${w.name} 回報「${task.title}」受阻`);
+        } else if (fate === 'usage_limit') {
+          // 額度用完：agent 自己做不下去了，但任務沒問題，立刻交給別人
+          await this.api.releaseTask(w.id, task.id, {
+            reason: 'usage_limit',
+            note: '用量額度用完。中間成果都已推到任務分支，照檢查點的下一步接著做即可。',
+          });
+          this.log(`${w.name} 額度用完，交出「${task.title}」`);
+          await this.sleep(9000);
+        } else if (fate === 'interrupt') {
+          // 人工打斷：例如電腦的主人按了 Ctrl+C
+          await this.api.releaseTask(w.id, task.id, {
+            reason: 'interrupted',
+            note: '被人工打斷。已保存到最後一個檢查點。',
+          });
+          this.log(`${w.name} 被打斷，交出「${task.title}」`);
+          await this.sleep(7000);
         } else {
-          const isDev = task.labels.includes('code') || task.labels.includes('design');
           await this.api.submitResult(w.id, task.id, {
             summary: `已完成「${task.title}」，依驗收標準自查通過。`,
             pr_url: isDev ? `https://github.com/example/site/pull/${100 + Math.floor(this.rand() * 900)}` : undefined,

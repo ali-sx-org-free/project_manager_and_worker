@@ -9,6 +9,10 @@
 | --- | --- | --- |
 | ![側欄](docs/screenshots/02-review-panel.png) | ![聚焦](docs/screenshots/03-focus-project.png) | ![列表](docs/screenshots/04-list.png) |
 
+| 斷線後等人接手（白色進度環） | 接力記錄：兩個 worker 接著做完 |
+| --- | --- |
+| ![待接手](docs/screenshots/05-waiting-takeover.png) | ![接力記錄](docs/screenshots/06-handoff-log.png) |
+
 **想一步步驗收和上手操作，請看 [docs/TUTORIAL.md](docs/TUTORIAL.md)。**
 
 ## 一分鐘跑起來
@@ -23,9 +27,11 @@ npm run demo        # 構建網頁，啟動協調服務 + 模擬器
 打開 <http://localhost:4000>。模擬器會扮演 4 台電腦上的 worker 和一個 PM，你會看到任務被領取、交付、review、解鎖下游。
 第一輪劇情是固定的，方便討論：
 
-- 「第三方登入」做到一半時 worker 的電腦斷線，租約 6 秒後過期，任務自動回到任務池被別人接手
+- 「調研三款投影機」做到 40% 被人工打斷，任務帶著進度回到任務池
 - 「頭像生成模型微調」被 worker 回報受阻，8 秒後 PM 解除（你也可以搶先在側欄點「解除阻塞」）
+- 「登入 / 註冊 API」做到 60% 時 agent 額度用完，另一個 worker 從 60% 接著做
 - 「登入頁設計稿」第一次 review 被退回，原來的 worker 帶著意見重做
+- 「第三方登入」做到 40% 時 worker 的電腦斷線，租約 6 秒後過期，另一個 worker 從 40% 接手
 
 點任何節點可以看驗收標準、PR 鏈接、review 記錄；任務在「待 review」時你可以搶在模擬 PM 之前批准或退回。
 
@@ -35,7 +41,7 @@ npm run demo        # 構建網頁，啟動協調服務 + 模擬器
 npm run dev         # 開發模式：服務 + 模擬器 + vite（http://localhost:5173，改前端即時刷新）
 npm run server      # 只啟動協調服務（真實用法，資料庫 data/pm.db，租約 30 分鐘）
 npm run sim         # 對著已啟動的服務跑模擬器
-npm test            # 狀態機 + REST + MCP + WebSocket 共 11 項測試
+npm test            # 狀態機 + REST + MCP + WebSocket + 續作，共 16 項測試
 ```
 
 不想啟動服務也可以：網頁連不上協調服務時（或網址加 `?demo`）會自動改成「瀏覽器內模擬」，
@@ -72,7 +78,7 @@ npm test            # 狀態機 + REST + MCP + WebSocket 共 11 項測試
 ```
 pending ──依賴全部 done──▶ ready ──claim──▶ claimed ──submit──▶ in_review ──approve──▶ done
                             ▲ ▲               │   │                │
-                            │ └─租約超時/釋放─┘   └─report_blocked─▶ blocked ──unblock──▶ ready
+                            │ └─租約超時/交出─┘   └─report_blocked─▶ blocked ──unblock──▶ ready
                             │                                      
                             └──── changes_requested ◀──reject──────┘（再次 claim 回到 claimed）
 ```
@@ -88,7 +94,43 @@ pending ──依賴全部 done──▶ ready ──claim──▶ claimed ─�
   原 worker 之後再心跳或提交會收到 `lease_lost`。
 - **review**：`approve` 後任務 `done`，並把依賴已全部完成的下游變成 `ready`；項目內全部 `done` 時 PM 交付項目。
   `reject` 進入 `changes_requested`，優先還給原來的 worker，review 意見留在任務上。
+- **續作**：見下一節。任務回到 `ready` 時進度、檢查點和任務分支都留在任務上。
 - **事件**：每次變更寫一條事件（帶變更後的任務/worker 快照）並通過 WebSocket 推送。網頁只靠事件更新，回放也是重放這些事件。
+
+### 斷連後接手續作
+
+agent 執行任務時隨時可能斷：網路抖動、被人打斷、usage limit、電腦睡眠或斷電。目標是別的 agent 接手時接著做，不從頭開始。
+
+做法是把「做到哪了」記在任務上，而不是記在 worker 上。每個任務帶著三樣東西：
+
+| 欄位 | 內容 |
+| --- | --- |
+| `progress` | 0 到 100 |
+| `worklog` | 只增不改的接力記錄。兩種條目：`checkpoint`（做了什麼 `summary`、接下來做什麼 `next_steps`、`progress`、`commit`、`artifacts`）和 `interrupted`（誰、什麼原因、交接說明） |
+| `branch` | 這個任務固定的 git 分支 `task/<key>-<id 後綴>`，中間成果 push 在這裡 |
+
+流程：
+
+1. **存檢查點**。agent 每完成一小步調用 `save_checkpoint`（同時續約）。runner 另外每分鐘兜底一次：`GIT_SYNC=1` 時把未提交的改動 commit 並 push 到任務分支，記成自動檢查點。所以即使 agent 一個檢查點都不存，代碼也不會只留在斷線的那台電腦上。
+2. **中斷**。三條路徑最後都是任務回到 `ready`，並在 `worklog` 記一條 `interrupted`：
+
+   | 情況 | 誰發現 | 動作 |
+   | --- | --- | --- |
+   | 人工打斷（Ctrl+C / SIGTERM） | runner | 停 agent → 最後存一次檢查點 → `release_task(reason=interrupted)`，任務立刻可領 |
+   | usage limit | runner（agent 非 0 退出且輸出匹配 `HANDOFF_PATTERN`） | 存檢查點 → `release_task(reason=usage_limit)`，這台電腦冷卻 `COOLDOWN_MS` |
+   | 網路抖動、睡眠、斷電、強殺 | 協調服務（心跳停了） | 租約超時後 `tick` 回收，原因記為 `lease_expired` |
+
+3. **接手**。`claim_task` 的返回裡帶 `resume`：上一位是誰、為什麼停、交接說明、進度、最後一個檢查點的 `summary` 和 `next_steps`、分支、commit、最近幾個檢查點。runner 先切到任務分支（遠端有就接著遠端），再把這些寫進給 agent 的提示詞，明確要求「不要從頭開始」。事件流裡記成 `task_resumed`，畫面上顯示「乙 接手…，從 60% 繼續」。
+4. **領取順序**。自己做到一半的任務排最前（斷線回來先把自己的做完）；自己剛因為額度用完或被打斷交出去的任務排最後（留給別人，沒人要再自己領回）。
+5. **防止兩個人同時做**。租約過期後，原持有者的 `heartbeat`、`save_checkpoint`、`submit_result` 都會收到 `lease_lost`。runner 這時去看任務：還沒被領走就重新領回，agent 不用停；已經被別人領走就停掉 agent，並且不再 push。每次 push 之前也會先發一次心跳確認自己還持有任務。
+
+已知的限制：
+
+- 續作的質量取決於檢查點寫得多細。協調服務只保證檢查點不丟、接手者拿得到，不保證 agent 真的照著做。
+- 沒有 push 出去的改動，接手者拿不到。斷網期間原 worker 多做的部分只留在它本地，目前沒有合併回來的機制。
+- 自動檢查點只有 commit，沒有進度百分比和「接下來做什麼」，這些只能靠 agent 自己寫。
+- usage limit 是靠輸出文字匹配判斷的，還沒對照真實 agent 的輸出校準過。
+- 只接力代碼（git）。agent 的對話上下文不會傳給下一位，下一位靠檢查點的文字說明重建上下文。
 
 ### REST
 
@@ -101,8 +143,10 @@ pending ──依賴全部 done──▶ ready ──claim──▶ claimed ─�
 | GET | `/api/tasks/claimable?worker_id=` | 這個 worker 可領的任務 |
 | POST | `/api/tasks/claim` | 原子領取 |
 | POST | `/api/tasks/:id/heartbeat` | 續約 |
+| POST | `/api/tasks/:id/checkpoint` | 保存檢查點（同時續約） |
 | POST | `/api/tasks/:id/submit` | 交付（`summary`、`pr_url`） |
-| POST | `/api/tasks/:id/block` · `/release` | 回報受阻 · 主動釋放 |
+| POST | `/api/tasks/:id/block` | 回報受阻 |
+| POST | `/api/tasks/:id/release` | 主動交出（`reason`、`note`），任務立刻回到任務池 |
 | POST | `/api/tasks/:id/review` | 批准 / 退回 |
 | POST | `/api/tasks/:id/unblock` | 解除阻塞 |
 
@@ -118,7 +162,7 @@ claude mcp add --transport http agent-pm http://<協調服務地址>:4000/mcp
 
 | 角色 | 工具 |
 | --- | --- |
-| Worker | `register_worker` `list_ready_tasks` `claim_task` `heartbeat` `submit_result` `report_blocked` |
+| Worker | `register_worker` `list_ready_tasks` `claim_task` `heartbeat` `save_checkpoint` `release_task` `submit_result` `report_blocked` |
 | PM | `create_project` `list_tasks` `get_task` `review_task` `unblock_task` |
 
 ### Worker runner
@@ -128,19 +172,36 @@ PM_URL=http://<協調服務地址>:4000 \
 WORKER_ID=home-pc WORKER_NAME=小家 WORKER_MACHINE=家用電腦 \
 WORKER_LABELS=code,gpu,home-pc \
 npm run runner                 # 預設用 `claude -p "<任務提示詞>"` 執行，可用 AGENT_CMD 換成別的命令
-npm run runner -- --dry-run    # 不啟動真實 agent，假裝幹 6 秒活，用來驗證連通
+npm run runner -- --dry-run    # 不啟動真實 agent，假裝分 6 步幹活、每步存檢查點，用來驗證連通和續作
+npm run runner -- --fake-agent # 用 docs/examples/fake-agent.mjs 當 agent（往檔案裡寫五章），用來驗證跨電腦接力
 ```
 
 用 `WORK_DIR` 指定 agent 的工作目錄（通常是那台電腦上的代碼倉庫），預設是啟動 runner 時所在的目錄。
 
-runner 負責領取和心跳，agent 負責幹活並通過 MCP 調用 `submit_result`。
-agent 退出時如果沒有自己提交，runner 兜底：正常退出就用輸出尾部當 summary 提交，異常退出就回報 `blocked`。
-租約丟失時 runner 會終止 agent。
+runner 負責領取、心跳和兜底，agent 負責幹活並通過 MCP 調用 `save_checkpoint` 和 `submit_result`。
+agent 退出時如果沒有自己提交，runner 兜底：正常退出就用輸出尾部當 summary 提交；輸出像是額度用完就存檢查點並交出任務；其他異常退出回報 `blocked`。
+各種斷連時 runner 的行為見上面的「斷連後接手續作」。
+
+| 環境變量 | 預設 | 用途 |
+| --- | --- | --- |
+| `PM_URL` · `PM_TOKEN` | `http://localhost:4000` | 協調服務地址和 token |
+| `WORKER_ID` · `WORKER_NAME` · `WORKER_MACHINE` · `WORKER_LABELS` | 主機名 · 無標籤 | worker 身份和能力標籤（逗號分隔） |
+| `AGENT_CMD` | `claude -p` | 啟動 agent 的命令，提示詞作為最後一個參數 |
+| `WORK_DIR` | 啟動時所在目錄 | agent 的工作目錄 |
+| `GIT_SYNC` | 關 | 設成 `1`：領取時切到任務分支，自動檢查點和交接時 commit 並 push |
+| `GIT_BASE` | `origin` 的預設分支 | 新任務分支從哪裡分出來 |
+| `AUTO_CHECKPOINT_MS` | `60000` | 自動檢查點的間隔 |
+| `HANDOFF_PATTERN` | `usage limit\|rate limit\|quota\|額度` | agent 異常退出時，輸出匹配這個正則就當作額度用完 |
+| `COOLDOWN_MS` | `600000` | 額度用完後這台電腦多久不領任務 |
+| `POLL_MS` | `5000` | 沒任務時多久問一次 |
+
+agent 進程會收到 `PM_URL`、`PM_WORKER_ID`、`PM_TASK_ID`、`PM_TASK_KEY`、`PM_TASK_BRANCH`、`PM_RESUME_PROGRESS` 這幾個環境變量。
 
 ## 3D 視窗怎麼看
 
 - **泳道**：每個項目一塊檯面，任務按依賴從左到右分層排開。
 - **節點顏色**：灰 等待依賴、藍 可領取（呼吸）、黃 執行中（旋轉環）、紫 待 review、橙 退回修改、紅 受阻（閃爍）、綠 已完成。
+- **進度環**：做到一半的任務外圈有一段環，長度是進度。執行中是狀態色，中斷後等人接手是白色並寫著「待接手 N%」。側欄裡有完整的接力記錄。
 - **光流**：任務通過 review 時，沿連線有一顆光點流向下游。
 - **Worker**：小機器人，領到任務飛過去繞著節點轉，每次心跳天線閃一下；失聯就變暗落回前緣。
 - **PM**：後上方的金色晶體，對每個待 review 的節點照一道紫色光束。
@@ -155,3 +216,7 @@ agent 退出時如果沒有自己提交，runner 兜底：正常退出就用輸�
 5. **鑒權和身份**：現在是一個共享 token，worker 自報 id。同事的電腦用誰的帳號、能看到哪些項目還沒設計。
 6. **上下文傳遞**：下游任務怎麼拿到上游的交付物（PR、文件、調研結果）？現在只有任務上的 `result.summary` 和 `pr_url`。
 7. **交付物驗證**：PR 鏈接只是字符串，沒有對接 GitHub 檢查 CI 狀態或合併。
+8. **對話上下文的接力**：現在接手者只拿到檢查點的文字和 git 分支。要不要把上一位 agent 的對話記錄（或它的摘要）也存下來交給下一位？存在哪、多大、有沒有隱私問題？
+9. **檢查點的強制程度**：agent 不存檢查點時只有 runner 的自動 commit。要不要規定「超過 N 分鐘沒有檢查點就提醒或中斷」？
+10. **沒推上去的改動**：斷網的 worker 回來發現任務已被接手時，它本地多做的部分現在只是留著。要不要自動推到一個旁支，讓接手者或 PM 決定要不要合併？
+11. **usage limit 的識別**：現在靠輸出文字匹配。更可靠的做法是 agent 自己在額度快用完時調用 `release_task`，或者 runner 讀 agent 的結構化退出資訊。

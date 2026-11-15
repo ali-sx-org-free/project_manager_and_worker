@@ -75,6 +75,11 @@ export function TaskNode({ task, position, selected, onSelect }: Props) {
   });
 
   const tag = task.labels.length ? ` · ${task.labels.join(' ')}` : '';
+  // 做到一半的任務（執行中，或中斷後等人接手）顯示進度環：換人之後環不會歸零
+  const partial =
+    task.progress > 0 && task.progress < 100 && task.state !== 'done' && task.state !== 'in_review' && task.state !== 'pending';
+  const waiting = partial && (task.state === 'ready' || task.state === 'changes_requested');
+  const status = partial ? `${waiting ? '待接手' : meta.label} ${task.progress}%` : meta.label;
   return (
     <group
       position={position}
@@ -118,9 +123,23 @@ export function TaskNode({ task, position, selected, onSelect }: Props) {
         <meshBasicMaterial color={meta.color} toneMapped={false} />
       </mesh>
 
+      {partial && (
+        <group rotation-x={-Math.PI / 2} position-y={0.06}>
+          <mesh>
+            <ringGeometry args={[0.9, 1.05, 64]} />
+            <meshBasicMaterial color="#26324f" transparent opacity={0.9} depthWrite={false} />
+          </mesh>
+          {/* 從正前方順時針填滿 */}
+          <mesh position-z={0.01} rotation-z={-Math.PI / 2} scale={[1, -1, 1]}>
+            <ringGeometry key={task.progress} args={[0.9, 1.05, 64, 1, 0, (task.progress / 100) * Math.PI * 2]} />
+            <meshBasicMaterial color={waiting ? '#ffffff' : meta.color} side={2} toneMapped={false} />
+          </mesh>
+        </group>
+      )}
+
       {selected && (
         <mesh rotation-x={-Math.PI / 2} position-y={0.05}>
-          <ringGeometry args={[1.02, 1.1, 48]} />
+          <ringGeometry args={[1.14, 1.21, 48]} />
           <meshBasicMaterial color="#ffffff" toneMapped={false} />
         </mesh>
       )}
@@ -131,7 +150,7 @@ export function TaskNode({ task, position, selected, onSelect }: Props) {
         border={selected ? '#ffffff' : hover ? meta.color : 'rgba(120,140,190,0.28)'}
         lines={[
           { text: short(task.title), size: 16, weight: 600 },
-          { text: `${meta.label}${tag}`, size: 12, color: task.state === 'pending' ? '#8090b0' : meta.color },
+          { text: `${status}${tag}`, size: 12, color: task.state === 'pending' ? '#8090b0' : meta.color },
         ]}
         opacity={task.state === 'pending' ? 0.75 : 1}
       />

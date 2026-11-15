@@ -1,24 +1,36 @@
 /**
- * Worker runner：每台電腦常駐一個。只做三件事：
+ * Worker runner：每台電腦常駐一個。
  *   1. 定時問協調服務「有沒有適合我的任務」，有就原子領取
  *   2. 用 headless 模式啟動本地 agent（預設 `claude -p`）去執行
- *   3. 執行期間定時發心跳；租約丟失就殺掉 agent
+ *   3. 執行期間定時發心跳、定時存檢查點
+ *   4. 任何原因中斷時，盡量把現場交接出去，讓別的 worker 接著做而不是重做
  *
- * Agent 可以自己通過 MCP 調用 submit_result（帶 PR 鏈接）。如果 agent 退出時還沒提交，
- * runner 會兜底：正常退出就用輸出尾部作為 summary 提交，異常退出就回報 blocked。
+ * 中斷時 runner 做什麼：
+ *   - 人工打斷（Ctrl+C / SIGTERM）  停掉 agent → 存最後一個檢查點 → release_task(reason=interrupted)，任務立刻可被接手
+ *   - agent 用量額度用完            agent 異常退出且輸出命中 HANDOFF_PATTERN → 存檢查點 → release_task(reason=usage_limit)，
+ *                                   然後本機冷卻 COOLDOWN_MS 再領任務
+ *   - 斷網、關機、runner 被強殺     什麼都來不及做。靠的是之前定時存下的檢查點；租約超時後任務回到任務池
+ *   - 短暫網絡抖動                  心跳失敗只重試，不停 agent。如果租約已經超時但還沒人接手，重新領回來繼續
+ *   - 租約被別人拿走                立刻停掉 agent，不再寫入
  *
  * 用法：
  *   PM_URL=http://host:4000 WORKER_ID=home-pc WORKER_LABELS=code,gpu npm run runner
- *   WORK_DIR=~/code/my-repo ... npm run runner   # 指定 agent 的工作目錄（預設是啟動 runner 時所在的目錄）
- *   npm run runner -- --dry-run     # 不啟動真實 agent，假裝幹幾秒活，用來驗證連通
- *   npm run runner -- --once        # 做完一個任務就退出
+ *   WORK_DIR=~/code/my-repo GIT_SYNC=1 ... npm run runner   # 中間成果自動 commit 並 push 到任務分支
+ *   npm run runner -- --dry-run     # 不啟動真實 agent，假裝分 6 步幹活、每步存檢查點
+ *   npm run runner -- --fake-agent  # 用 docs/examples/fake-agent.mjs 當 agent（寫一份五章的文件），驗收接力用
+ *   npm run runner -- --once        # 做完（或交出）一個任務就退出
  */
-import { spawn } from 'node:child_process';
+import { execFileSync, spawn, type ChildProcess } from 'node:child_process';
 import os from 'node:os';
-import { httpApi, PmError, type Task } from '@agent-pm/core';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { buildResume, httpApi, INTERRUPT_LABEL, PmError, type ResumeContext, type Task } from '@agent-pm/core';
 
 const args = new Set(process.argv.slice(2));
 const env = process.env;
+/** 使用者敲命令時所在的目錄（npm 會把 cwd 換成 packages/runner，所以用 INIT_CWD） */
+const startDir = env.INIT_CWD ?? process.cwd();
+const fakeAgent = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../../docs/examples/fake-agent.mjs');
 
 const config = {
   url: env.PM_URL ?? 'http://localhost:4000',
@@ -28,10 +40,18 @@ const config = {
   machine: env.WORKER_MACHINE ?? os.hostname(),
   labels: (env.WORKER_LABELS ?? '').split(',').map((s) => s.trim()).filter(Boolean),
   /** 啟動 agent 的命令，任務提示詞會作為最後一個參數傳入 */
-  agentCmd: env.AGENT_CMD ?? 'claude -p',
+  agentCmd: args.has('--fake-agent') ? `node ${fakeAgent}` : (env.AGENT_CMD ?? 'claude -p'),
   /** agent 的工作目錄，通常是這台電腦上的代碼倉庫；預設為啟動 runner 時所在的目錄 */
-  workDir: env.WORK_DIR ?? env.INIT_CWD ?? process.cwd(),
+  workDir: path.resolve(startDir, env.WORK_DIR ?? '.'),
   pollMs: Number(env.POLL_MS ?? 5000),
+  /** 每隔多久自動存一次檢查點（真實 agent 模式） */
+  checkpointMs: Number(env.AUTO_CHECKPOINT_MS ?? 60_000),
+  /** 開啟後，檢查點會把 WORK_DIR 的改動 commit 並 push 到任務分支；領取時先切到該分支。需要 WORK_DIR 是 git 倉庫 */
+  gitSync: env.GIT_SYNC === '1',
+  /** agent 異常退出時，輸出命中這個正則就視為「額度用完」而不是任務有問題 */
+  handoffPattern: new RegExp(env.HANDOFF_PATTERN ?? 'usage limit|rate limit|quota|額度', 'i'),
+  /** 額度用完後本機冷卻多久再領任務 */
+  cooldownMs: Number(env.COOLDOWN_MS ?? 10 * 60_000),
   dryRun: args.has('--dry-run'),
   once: args.has('--once'),
 };
@@ -40,12 +60,64 @@ const api = httpApi(config.url, config.token);
 const log = (msg: string) => console.log(`[runner ${config.workerId}] ${msg}`);
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
-function buildPrompt(task: Task): string {
+// ───────────────────────── git：中間成果跟著任務分支走 ─────────────────────────
+
+function git(...a: string[]): string {
+  return execFileSync('git', a, { cwd: config.workDir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
+}
+const gitOk = (...a: string[]) => {
+  try {
+    git(...a);
+    return true;
+  } catch {
+    return false;
+  }
+};
+
+/** 領取後切到任務分支。
+ *  - 分支在遠端已存在（別人做過一部分）：以遠端為準，這就是「接著做」的起點
+ *  - 不存在：從主幹（GIT_BASE，預設遠端的預設分支）開一個新的
+ *  本機上一次被強殺留下的未提交改動先 stash 起來，不帶進這個任務。 */
+function gitPrepare(branch: string) {
+  gitOk('fetch', 'origin');
+  if (git('status', '--porcelain')) {
+    git('stash', 'push', '-u', '-q', '-m', `agent-pm：切到 ${branch} 之前的遺留改動`);
+    log('工作目錄有未提交的遺留改動，已 stash');
+  }
+  if (gitOk('rev-parse', '--verify', '--quiet', `origin/${branch}`)) {
+    git('checkout', '-q', '-B', branch, `origin/${branch}`);
+    log(`已切到任務分支 ${branch}（接續遠端 ${git('rev-parse', '--short', 'HEAD')}）`);
+    return;
+  }
+  const base =
+    env.GIT_BASE ??
+    ['origin/HEAD', 'origin/main', 'origin/master'].find((b) => gitOk('rev-parse', '--verify', '--quiet', b)) ??
+    'HEAD';
+  git('checkout', '-q', '-B', branch, base);
+  log(`已從 ${base} 建立任務分支 ${branch}`);
+}
+
+/** 把目前的改動 commit 並 push 到任務分支，返回 commit。沒有改動時返回目前的 HEAD。 */
+function gitCheckpoint(task: Task, label: string): string {
+  git('add', '-A');
+  if (!gitOk('diff', '--cached', '--quiet')) {
+    const ident = gitOk('config', 'user.name')
+      ? []
+      : ['-c', `user.name=${config.name}`, '-c', `user.email=${config.workerId}@agent-pm.local`];
+    git(...ident, 'commit', '-q', '-m', `wip(${task.key}): ${label} [${config.workerId}]`);
+  }
+  git('push', '-q', '-u', 'origin', `HEAD:${task.branch}`);
+  return git('rev-parse', '--short', 'HEAD');
+}
+
+// ───────────────────────── 提示詞 ─────────────────────────
+
+function buildPrompt(task: Task, resume: ResumeContext | null): string {
   const reviews = task.reviews
     .filter((r) => r.decision === 'reject')
     .map((r) => `- ${r.reviewer}：${r.comment}`)
     .join('\n');
-  return [
+  const lines = [
     `你是 Worker Agent「${config.name}」（worker_id: ${config.workerId}），已經為你領取了下面這個任務。`,
     ``,
     `任務 id：${task.id}`,
@@ -53,90 +125,229 @@ function buildPrompt(task: Task): string {
     `描述：${task.description || '（無）'}`,
     `驗收標準：${task.acceptance || '（無）'}`,
     reviews ? `上一次被 PM 退回的意見：\n${reviews}` : '',
+  ];
+  if (resume) {
+    lines.push(
+      ``,
+      `【這是接手續作，不要從頭開始】`,
+      `這個任務之前已經做到 ${resume.progress}%${resume.reason ? `，上一位停下的原因：${INTERRUPT_LABEL[resume.reason]}` : ''}。`,
+      `最後一個檢查點：${resume.summary}`,
+      resume.next_steps ? `接下來要做：${resume.next_steps}` : '',
+      resume.handoff_note ? `交接說明：${resume.handoff_note}` : '',
+      resume.auto_note ? `中斷前的輸出片段：${resume.auto_note}` : '',
+      config.gitSync
+        ? `已有的中間成果在分支 ${resume.branch}${resume.commit ? `（${resume.commit}）` : ''}，工作目錄已經切到這個分支。`
+        : `已有的中間成果應該在分支 ${resume.branch}${resume.commit ? `（${resume.commit}）` : ''}。`,
+      `請先查看目前的實際內容，確認哪些已經完成（以實際內容為準），再從未完成的部分接著做。`,
+    );
+  }
+  lines.push(
     ``,
-    `完成後請調用 agent-pm 的 MCP 工具 submit_result（worker_id、task_id、summary；代碼改動請開 PR 並填 pr_url）。`,
-    `如果無法繼續，調用 report_blocked 並說明原因。心跳由 runner 負責，你不需要調用 heartbeat。`,
-  ]
-    .filter((l) => l !== '')
-    .join('\n');
+    `執行過程中，每完成一個有意義的小步驟，就調用 agent-pm 的 MCP 工具 save_checkpoint（worker_id、task_id、summary、next_steps、progress）。`,
+    `你隨時可能被中斷，接手的 agent 只能看到檢查點，所以要寫到別人照著就能接著做的程度。`,
+    `全部完成後調用 submit_result（worker_id、task_id、summary；代碼改動請開 PR 並填 pr_url）。`,
+    `如果任務本身無法繼續，調用 report_blocked 並說明原因。心跳由 runner 負責，你不需要調用 heartbeat。`,
+  );
+  return lines.filter((l, i) => l !== '' || lines[i - 1] !== '').join('\n');
 }
 
-/** 啟動 agent，返回退出碼和輸出尾部。onChild 讓外面在租約丟失時可以殺掉它。 */
-function runAgent(task: Task, onChild: (kill: () => void) => void) {
-  return new Promise<{ code: number; tail: string }>((resolve) => {
-    if (config.dryRun) {
-      const timer = setTimeout(() => resolve({ code: 0, tail: `（dry-run）假裝完成了「${task.title}」` }), 6000);
-      onChild(() => {
-        clearTimeout(timer);
-        resolve({ code: 143, tail: '被終止' });
-      });
-      return;
+// ───────────────────────── 執行 agent ─────────────────────────
+
+interface Run {
+  done: Promise<{ code: number; tail: string }>;
+  stop: () => void;
+  tail: () => string;
+}
+
+/** dry-run：假裝分 6 步幹活，每步存一個檢查點；接手時從檢查點的下一步開始 */
+function runFake(task: Task, resume: ResumeContext | null): Run {
+  const STEPS = 6;
+  let stopped = false;
+  let tail = '';
+  const from = resume ? Math.min(STEPS - 1, Math.round((resume.progress / 100) * STEPS)) : 0;
+  const done = (async () => {
+    if (from > 0) log(`（dry-run）接續檢查點，跳過前 ${from} 步，從第 ${from + 1}/${STEPS} 步開始`);
+    for (let step = from + 1; step <= STEPS; step++) {
+      await sleep(1500);
+      if (stopped) return { code: 143, tail: '被終止' };
+      tail = `（dry-run）完成第 ${step}/${STEPS} 步`;
+      log(tail);
+      if (step < STEPS) {
+        await api
+          .saveCheckpoint(config.workerId, task.id, {
+            summary: `完成第 ${step}/${STEPS} 步`,
+            next_steps: `從第 ${step + 1} 步繼續`,
+            progress: Math.round((step / STEPS) * 100),
+          })
+          .catch(() => {});
+      }
     }
-    const [cmd, ...cmdArgs] = config.agentCmd.split(' ').filter(Boolean);
-    const child = spawn(cmd, [...cmdArgs, buildPrompt(task)], {
+    return { code: 0, tail: `（dry-run）完成「${task.title}」，本次執行了第 ${from + 1} 到 ${STEPS} 步` };
+  })();
+  return { done, stop: () => (stopped = true), tail: () => tail };
+}
+
+function runAgent(task: Task, resume: ResumeContext | null): Run {
+  if (config.dryRun) return runFake(task, resume);
+  // 假 agent 的路徑可能含空格，不走按空格拆分的 AGENT_CMD
+  const [cmd, ...cmdArgs] = args.has('--fake-agent') ? [process.execPath, fakeAgent] : config.agentCmd.split(' ').filter(Boolean);
+  let tail = '';
+  let child: ChildProcess | null = null;
+  const done = new Promise<{ code: number; tail: string }>((resolve) => {
+    child = spawn(cmd, [...cmdArgs, buildPrompt(task, resume)], {
       cwd: config.workDir,
       stdio: ['ignore', 'pipe', 'pipe'],
-      env: { ...env, PM_TASK_ID: task.id, PM_WORKER_ID: config.workerId, PM_URL: config.url },
+      env: {
+        ...env,
+        PM_URL: config.url,
+        PM_WORKER_ID: config.workerId,
+        PM_TASK_ID: task.id,
+        PM_TASK_KEY: task.key,
+        PM_TASK_BRANCH: task.branch,
+        PM_RESUME_PROGRESS: String(resume?.progress ?? 0),
+      },
     });
-    let tail = '';
     const keep = (buf: Buffer) => {
       process.stdout.write(buf);
       tail = (tail + buf.toString()).slice(-2000);
     };
-    child.stdout.on('data', keep);
-    child.stderr.on('data', keep);
+    child.stdout?.on('data', keep);
+    child.stderr?.on('data', keep);
     child.on('error', (err) => resolve({ code: 127, tail: `無法啟動 agent（${config.agentCmd}）：${err.message}` }));
-    child.on('close', (code) => resolve({ code: code ?? 1, tail }));
-    onChild(() => child.kill('SIGTERM'));
+    child.on('close', (code, signal) => resolve({ code: code ?? (signal ? 143 : 1), tail }));
   });
+  return { done, stop: () => child?.kill('SIGTERM'), tail: () => tail };
 }
 
-async function work(task: Task, leaseMs: number) {
-  log(`領取「${task.title}」（第 ${task.attempt} 次）`);
-  let kill = () => {};
+// ───────────────────────── 一個任務的完整生命週期 ─────────────────────────
+
+let interrupted = false; // 收到 Ctrl+C / SIGTERM
+let current: { stop: () => void } | null = null;
+
+async function work(task: Task, leaseMs: number): Promise<'done' | 'handed_off' | 'cooldown'> {
+  const resume = buildResume(task);
+  log(
+    resume
+      ? `${resume.from_worker === config.workerId ? '回來繼續' : '接手'}「${task.title}」（第 ${task.attempt} 次領取），從 ${resume.progress}% 繼續。上一位：${resume.from_worker === config.workerId ? '自己' : resume.from_worker}${resume.reason ? `，${INTERRUPT_LABEL[resume.reason]}` : ''}`
+      : `領取「${task.title}」（第 ${task.attempt} 次領取），從頭開始`,
+  );
+
+  if (config.gitSync && !config.dryRun) {
+    try {
+      gitPrepare(task.branch);
+    } catch (err) {
+      await api.releaseTask(config.workerId, task.id, {
+        reason: 'error',
+        note: `無法切到任務分支 ${task.branch}：${err instanceof Error ? err.message.slice(0, 300) : err}`,
+      });
+      log(`無法準備任務分支，已交出任務`);
+      return 'handed_off';
+    }
+  }
+
+  const run = runAgent(task, resume);
+  current = run;
   let leaseLost = false;
+
+  /** 存一個自動檢查點：先確認租約還在自己手上，再 push，最後記到協調服務 */
+  let lastAuto = '';
+  const autoCheckpoint = async (label: string, force = true) => {
+    if (config.dryRun) return;
+    await api.heartbeat(config.workerId, task.id); // 租約不在了就會拋錯，不會把過期的改動推上去
+    const commit = config.gitSync ? gitCheckpoint(task, label) : undefined;
+    const out = run.tail().trim().slice(-600);
+    if (!force && lastAuto === `${commit}|${out}`) return; // 沒有新進展就不重複記
+    lastAuto = `${commit}|${out}`;
+    await api.saveCheckpoint(config.workerId, task.id, {
+      summary: `${label}${out ? `。agent 輸出片段：${out}` : ''}`,
+      commit,
+      auto: true,
+    });
+  };
+
+  const onLeaseLost = async () => {
+    const cur = await api.getTask(task.id).catch(() => null);
+    if (!cur) return;
+    if (cur.state === 'ready' || cur.state === 'changes_requested') {
+      // 網絡抖動太久導致租約超時，但還沒人接手：領回來繼續，agent 不用停
+      const again = await api.claimTask(config.workerId, task.id).catch(() => null);
+      if (again) return log('租約曾經超時，但任務還沒被接手，已重新領回，繼續執行');
+    }
+    if (cur.state === 'claimed' && cur.assignee !== config.workerId && !leaseLost) {
+      leaseLost = true;
+      log('任務已被別的 worker 接手，停止 agent（本機未推送的改動保留在本地，不會覆蓋對方）');
+      run.stop();
+    }
+    // 其餘情況（in_review / blocked / done）是 agent 自己處理完了，不用管
+  };
+
   const hb = setInterval(
-    async () => {
-      try {
-        await api.heartbeat(config.workerId, task.id);
-      } catch (err) {
-        // lease_lost 也可能是 agent 已經自己 submit 了，此時不該殺它
-        if (err instanceof PmError && err.code === 'lease_lost') {
-          const cur = await api.getTask(task.id).catch(() => null);
-          if (cur && cur.state === 'claimed') {
-            leaseLost = true;
-            log('租約已丟失，終止 agent');
-            kill();
-          }
-        }
-      }
+    () => {
+      api.heartbeat(config.workerId, task.id).catch((err) => {
+        if (err instanceof PmError && err.code === 'lease_lost') void onLeaseLost();
+        // 其他錯誤多半是網絡抖動，下一次心跳再試
+      });
     },
     Math.max(1000, Math.floor(leaseMs / 3)),
   );
+  const cp = setInterval(() => {
+    autoCheckpoint('自動檢查點', false).catch((err) => {
+      if (err instanceof PmError && err.code === 'lease_lost') void onLeaseLost();
+    });
+  }, config.checkpointMs);
 
-  const { code, tail } = await runAgent(task, (k) => (kill = k));
+  const { code, tail } = await run.done;
   clearInterval(hb);
-  if (leaseLost) return;
+  clearInterval(cp);
+  current = null;
+  if (leaseLost) return 'handed_off';
 
-  // 兜底：agent 沒有自己提交時由 runner 收尾
   const cur = await api.getTask(task.id);
   if (cur.state !== 'claimed' || cur.assignee !== config.workerId) {
     log(`agent 已自行處理，任務狀態 ${cur.state}`);
-    return;
+    return 'done';
+  }
+  const lastWords = tail.trim().slice(-500);
+
+  if (interrupted) {
+    await autoCheckpoint('被打斷前的最後狀態').catch(() => {});
+    await api.releaseTask(config.workerId, task.id, {
+      reason: 'interrupted',
+      note: '在這台電腦上被人工打斷。已保存到最後一個檢查點，可以直接接著做。',
+    });
+    log('已保存檢查點並交出任務，其他 worker 可以立刻接手');
+    return 'handed_off';
   }
   if (code === 0) {
-    await api.submitResult(config.workerId, task.id, { summary: tail.trim().slice(-1500) || '已完成' });
+    const commit = config.gitSync && !config.dryRun ? gitCheckpoint(task, '完成') : undefined;
+    await api.submitResult(config.workerId, task.id, {
+      summary: `${lastWords || '已完成'}${commit ? `\n分支 ${task.branch}，commit ${commit}` : ''}`,
+    });
     log('agent 正常退出，已代為提交');
-  } else {
-    await api.reportBlocked(config.workerId, task.id, `agent 異常退出（code ${code}）：${tail.trim().slice(-500)}`);
-    log(`agent 異常退出（code ${code}），已回報 blocked`);
+    return 'done';
   }
+  if (config.handoffPattern.test(tail)) {
+    await autoCheckpoint('額度用完前的最後狀態').catch(() => {});
+    await api.releaseTask(config.workerId, task.id, {
+      reason: 'usage_limit',
+      note: `這台電腦上的 agent 用量額度用完。${lastWords ? `最後輸出：${lastWords}` : ''}`,
+    });
+    log(`agent 額度用完，已保存檢查點並交出任務`);
+    return 'cooldown';
+  }
+  await autoCheckpoint('異常退出前的最後狀態').catch(() => {});
+  await api.reportBlocked(config.workerId, task.id, `agent 異常退出（code ${code}）：${lastWords}`);
+  log(`agent 異常退出（code ${code}），已回報 blocked`);
+  return 'done';
 }
 
 async function main() {
-  log(`連接 ${config.url}，標籤 [${config.labels.join(', ')}]${config.dryRun ? '，dry-run' : `，agent 工作目錄 ${config.workDir}`}`);
+  log(
+    `連接 ${config.url}，標籤 [${config.labels.join(', ')}]` +
+      (config.dryRun ? '，dry-run' : `，agent 工作目錄 ${config.workDir}${config.gitSync ? '，git 同步已開啟' : ''}`),
+  );
   let registered = false;
-  for (;;) {
+  while (!interrupted) {
     try {
       if (!registered) {
         await api.registerWorker({
@@ -150,8 +361,12 @@ async function main() {
       const task = await api.claimTask(config.workerId);
       if (task) {
         const { lease_ms } = await api.snapshot();
-        await work(task, lease_ms);
-        if (config.once) return;
+        const outcome = await work(task, lease_ms);
+        if (config.once || interrupted) return;
+        if (outcome === 'cooldown') {
+          log(`冷卻 ${Math.round(config.cooldownMs / 1000)} 秒後再領任務`);
+          await sleep(config.cooldownMs);
+        }
         continue;
       }
     } catch (err) {
@@ -162,4 +377,17 @@ async function main() {
   }
 }
 
+// Ctrl+C / kill：不是直接退出，而是停掉 agent、存檢查點、交出任務後再退出
+for (const sig of ['SIGINT', 'SIGTERM'] as const) {
+  process.on(sig, () => {
+    if (interrupted) process.exit(130); // 再按一次強制退出
+    interrupted = true;
+    if (current) {
+      log('收到中斷信號，正在保存檢查點並交出任務…（再按一次強制退出）');
+      current.stop();
+    } else process.exit(0);
+  });
+}
+
 await main();
+process.exit(0);

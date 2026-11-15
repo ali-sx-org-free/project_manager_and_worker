@@ -30,6 +30,9 @@ CREATE TABLE IF NOT EXISTS tasks (
   result           TEXT,                          -- JSON：summary / pr_url
   reviews          TEXT NOT NULL DEFAULT '[]',   -- JSON 陣列：review 歷史
   blocked_reason   TEXT,
+  worklog          TEXT NOT NULL DEFAULT '[]',   -- JSON 陣列：檢查點與中斷記錄，換人續作靠它
+  progress         INTEGER NOT NULL DEFAULT 0,
+  branch           TEXT NOT NULL DEFAULT '',
   created_at       INTEGER NOT NULL,
   updated_at       INTEGER NOT NULL,
   UNIQUE (project_id, key)
@@ -62,17 +65,19 @@ CREATE TABLE IF NOT EXISTS events (
 );
 `;
 
-type TaskRow = Omit<Task, 'labels' | 'deps' | 'result' | 'reviews'> & {
+type TaskRow = Omit<Task, 'labels' | 'deps' | 'result' | 'reviews' | 'worklog'> & {
   labels: string;
   result: string | null;
   reviews: string;
+  worklog: string;
 };
 type WorkerRow = Omit<Worker, 'labels'> & { labels: string };
 
 const TASK_COLS = `project_id=@project_id, key=@key, title=@title, description=@description,
   acceptance=@acceptance, labels=@labels, state=@state, assignee=@assignee, last_assignee=@last_assignee,
   lease_expires_at=@lease_expires_at, attempt=@attempt, result=@result, reviews=@reviews,
-  blocked_reason=@blocked_reason, created_at=@created_at, updated_at=@updated_at`;
+  blocked_reason=@blocked_reason, worklog=@worklog, progress=@progress, branch=@branch,
+  created_at=@created_at, updated_at=@updated_at`;
 
 export class SqliteStore implements Store {
   readonly db: Database.Database;
@@ -84,6 +89,18 @@ export class SqliteStore implements Store {
     this.db.pragma('journal_mode = WAL');
     this.db.pragma('foreign_keys = ON');
     this.db.exec(SCHEMA);
+    this.migrate();
+  }
+
+  /** 舊版本建的資料庫補上後來新增的欄位 */
+  private migrate() {
+    const have = new Set((this.db.prepare(`PRAGMA table_info(tasks)`).all() as { name: string }[]).map((c) => c.name));
+    const add = (name: string, ddl: string) => {
+      if (!have.has(name)) this.db.exec(`ALTER TABLE tasks ADD COLUMN ${name} ${ddl}`);
+    };
+    add('worklog', `TEXT NOT NULL DEFAULT '[]'`);
+    add('progress', `INTEGER NOT NULL DEFAULT 0`);
+    add('branch', `TEXT NOT NULL DEFAULT ''`);
   }
 
   /** BEGIN IMMEDIATE：一開始就拿寫鎖，就算將來多進程共用同一個庫，領取也不會互相踩到 */
@@ -122,6 +139,7 @@ export class SqliteStore implements Store {
       labels: JSON.stringify(t.labels),
       result: t.result ? JSON.stringify(t.result) : null,
       reviews: JSON.stringify(t.reviews),
+      worklog: JSON.stringify(t.worklog),
     };
   }
   private depsOf(id: string): string[] {
@@ -142,6 +160,7 @@ export class SqliteStore implements Store {
       labels: JSON.parse(r.labels),
       result: r.result ? JSON.parse(r.result) : null,
       reviews: JSON.parse(r.reviews),
+      worklog: JSON.parse(r.worklog),
       deps: this.depsOf(r.id),
     };
   }
@@ -150,9 +169,10 @@ export class SqliteStore implements Store {
     this.db
       .prepare(
         `INSERT INTO tasks (id,project_id,key,title,description,acceptance,labels,state,assignee,last_assignee,
-           lease_expires_at,attempt,result,reviews,blocked_reason,created_at,updated_at)
+           lease_expires_at,attempt,result,reviews,blocked_reason,worklog,progress,branch,created_at,updated_at)
          VALUES (@id,@project_id,@key,@title,@description,@acceptance,@labels,@state,@assignee,@last_assignee,
-           @lease_expires_at,@attempt,@result,@reviews,@blocked_reason,@created_at,@updated_at)`,
+           @lease_expires_at,@attempt,@result,@reviews,@blocked_reason,@worklog,@progress,@branch,
+           @created_at,@updated_at)`,
       )
       .run(row);
     // 依賴的任務可能還沒插入（同一批建立），所以這個事務內暫緩外鍵檢查
