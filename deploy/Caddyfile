@@ -1,0 +1,6 @@
+# Caddy 會自動向 Let's Encrypt 申請並續期 {$PM_DOMAIN} 的證書（需要這個域名已經指向服務器，並開放 80、443 端口）。
+# WebSocket（/ws）和 MCP（/mcp）不用額外設定，reverse_proxy 會原樣轉發。
+{$PM_DOMAIN} {
+	encode gzip
+	reverse_proxy pm:4000
+}

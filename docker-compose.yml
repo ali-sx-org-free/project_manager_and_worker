@@ -1,0 +1,37 @@
+# 雲服務器上的部署：協調服務 + Caddy（自動申請 HTTPS 證書、反向代理 WebSocket 和 MCP）。
+# 用法見 docs/DEPLOY.md。設定寫在同目錄的 .env 裡（從 .env.example 複製）。
+services:
+  pm:
+    build: .
+    image: agent-pm:latest
+    restart: unless-stopped
+    init: true
+    environment:
+      PM_TOKEN: ${PM_TOKEN:?請在 .env 裡設定 PM_TOKEN}
+      LEASE_MS: ${LEASE_MS:-180000}
+    volumes:
+      # 資料庫和備份放在宿主機的 ./data；:Z 讓開著 SELinux 的系統（例如 CentOS）也能寫入
+      - ./data:/data:Z
+    # 4000 端口不對外開放，只給 caddy 連
+    expose:
+      - "4000"
+
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    depends_on:
+      - pm
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    environment:
+      PM_DOMAIN: ${PM_DOMAIN:?請在 .env 裡設定 PM_DOMAIN}
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro,z
+      - caddy_data:/data
+      - caddy_config:/config
+
+volumes:
+  caddy_data:
+  caddy_config:

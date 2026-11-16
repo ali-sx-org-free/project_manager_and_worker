@@ -13,6 +13,8 @@
 
 最後有一張[驗收清單](#驗收清單)，可以邊做邊打勾。
 
+驗收完想部署到雲服務器上真正使用，請看 [DEPLOY.md](DEPLOY.md)。
+
 先認識畫面：
 
 ![3D 總覽](screenshots/01-overview.png)
