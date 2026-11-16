@@ -5,7 +5,7 @@
  *   node scripts/backup-db.mjs [資料庫路徑] [備份目錄] [保留份數]
  *
  * 預設：資料庫是 $PM_DB（沒設就是 data/pm.db），備份放在資料庫旁邊的 backups/ 目錄，只保留最近 14 份。
- * 容器裡：docker compose exec -T pm node scripts/backup-db.mjs
+ * 服務器上：cd ~/agent-pm && node scripts/backup-db.mjs（詳見 docs/DEPLOY.md 第 13 步）
  */
 import Database from 'better-sqlite3';
 import fs from 'node:fs';

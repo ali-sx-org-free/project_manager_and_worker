@@ -19,7 +19,7 @@
 
 **想一步步驗收和上手操作，請看 [docs/TUTORIAL.md](docs/TUTORIAL.md)。**
 
-**想部署到雲服務器上真正使用（包括 CentOS 7），請看 [docs/DEPLOY.md](docs/DEPLOY.md)。**
+**想部署到雲服務器（Debian 12）上真正使用，請看 [docs/DEPLOY.md](docs/DEPLOY.md)。**
 
 ## 一分鐘跑起來
 
