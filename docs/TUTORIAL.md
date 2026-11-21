@@ -327,7 +327,7 @@ WORKER_ID=my-pc WORKER_NAME=我的電腦 WORKER_MACHINE=筆電 WORKER_LABELS=cod
 
 協調服務把所有操作暴露成 MCP 工具，支持 MCP 的 agent 配置一個地址就能用。這裡以 Claude Code 為例。
 
-說明：MCP 工具我用官方 MCP 客戶端（自動測試）和 curl 驗證過，但沒有用真實的 Claude Code 會話完整走過這條路線，所以這一節請當作操作指引，遇到出入告訴我。
+說明：Worker 這一半（D5 的 Skill）我用真實的 Claude Code 對著本機的協調服務跑過，驗證了什麼見 [D8](#d8-我驗證過什麼沒驗證過什麼)。PM 這一半（D4）和 D6 的 runner 接真實 agent，我只用官方 MCP 客戶端（自動測試）和 curl 驗證過，請當作操作指引，遇到出入告訴我。
 
 ### D1. 用較長的租約啟動
 
@@ -373,13 +373,85 @@ claude mcp list        # 應該列出 agent-pm
 
 > 用 agent-pm 的 list_projects 看每個項目的優先級、並行配額和正在執行的任務數。如果有緊急的項目被別的項目擠住了，用 update_project 調高它的優先級，或者調低別的項目的並行配額。
 
-### D5. 讓 agent 當 Worker
+### D5. 讓 agent 當 Worker（Skill，不用 runner）
 
-另開一個 Claude Code 會話，說：
+Worker 這台電腦不用 clone 這個倉庫，也不用跑 runner。只要 Claude Code 能用，再做三件事：加 MCP、裝 Skill、允許 agent-pm 的工具。Skill 在 [`skills/agent-pm-worker/SKILL.md`](../skills/agent-pm-worker/SKILL.md)，就是一份寫得很細的 Worker 工作流程：註冊、領取、續作、切任務分支、每步 push 和存檢查點、續約、收到 `lease_lost` 怎麼辦、交付或交出。
 
-> 你是 Worker。用 agent-pm 註冊成 worker_id 為 cc-1、標籤 code 的 worker，然後 claim_task 領一個任務。如果返回裡有 resume，說明有人做到一半，先讀它的 summary 和 next_steps，切到它給的分支，從那裡接著做，不要從頭開始。按任務描述和驗收標準完成任務，每完成一小步就 save_checkpoint 寫明做了什麼、接下來做什麼、進度百分比。完成後 submit_result 說明你做了什麼。做不下去就 report_blocked；如果只是你自己沒法繼續（例如額度快用完），先 save_checkpoint 再 release_task。
+**一次性設定（每台 worker 電腦做一次）**
 
-應該看到：網頁上出現機器人 cc-1 飛到節點上，節點變黃，每次 save_checkpoint 後進度環變長；agent 完成後節點變紫，等你或 PM agent review。
+1. 加 MCP。`-s user` 讓它在所有目錄都能用，因為 worker 是在代碼倉庫的目錄裡幹活，不是在這個目錄：
+
+   ```bash
+   claude mcp add --transport http -s user agent-pm http://localhost:4000/mcp
+   claude mcp list        # 應該列出 agent-pm，狀態是 Connected
+   ```
+
+   協調服務在別的機器上時把 `localhost:4000` 換成它的地址；設置了 `PM_TOKEN` 的話再加 `--header "Authorization: Bearer <這個人的 token>"`。
+
+2. 裝 Skill。放在 `~/.claude/skills/` 下面，所有目錄的 Claude Code 都能用：
+
+   ```bash
+   mkdir -p ~/.claude/skills/agent-pm-worker
+   curl -fsSL https://raw.githubusercontent.com/ali-sx-org-free/project_manager_and_worker/main/skills/agent-pm-worker/SKILL.md \
+     -o ~/.claude/skills/agent-pm-worker/SKILL.md
+   ```
+
+   已經 clone 了這個倉庫的話，也可以 `cp -r skills/agent-pm-worker ~/.claude/skills/`。Windows PowerShell：
+
+   ```powershell
+   New-Item -ItemType Directory -Force "$HOME\.claude\skills\agent-pm-worker" | Out-Null
+   Invoke-WebRequest https://raw.githubusercontent.com/ali-sx-org-free/project_manager_and_worker/main/skills/agent-pm-worker/SKILL.md -OutFile "$HOME\.claude\skills\agent-pm-worker\SKILL.md"
+   ```
+
+3. 允許 agent-pm 的工具，不用每次批准。打開 `~/.claude/settings.json`（Windows 是 `%USERPROFILE%\.claude\settings.json`，沒有就新建），在 `permissions.allow` 裡加上 `"mcp__agent-pm"`。新建的話整個檔案就是：
+
+   ```json
+   {
+     "permissions": {
+       "allow": ["mcp__agent-pm"]
+     }
+   }
+   ```
+
+   也可以在 Claude Code 裡輸入 `/permissions`，在 Allow 裡加一條 `mcp__agent-pm`。
+
+   **這一步不能省。** Skill 自帶的工具許可只在你輸入 `/agent-pm-worker` 的那一輪有效。之後的每一輪（你再說一句話、背景命令跑完把 agent 喚醒）`heartbeat` 都要你點批准。人不在電腦前時沒人點，3 分鐘後租約就過期了，任務會被收回給別人。我實測過這個情況：agent 拿不到續約的確認，就照 Skill 的規則不 push、不交付，只把成果 commit 在本地。
+
+**開始幹活**
+
+在代碼倉庫的目錄裡打開 Claude Code（例如 `cd ~/code/projects_site_v01 && claude`），輸入：
+
+```
+/agent-pm-worker worker_id=home-pc-cc labels=code
+```
+
+| 參數 | 含義 | 不給時 |
+| --- | --- | --- |
+| `worker_id` | 這個 worker 的固定 id。每台電腦固定用同一個，斷線回來時靠它認出你；同一台電腦開第二個會話要換一個 | `<主機名>-cc` |
+| `labels` | 能力標籤，逗號分隔 | 沿用上次註冊的標籤 |
+| `projects` | 只為這些項目（短名）幹活 | 有權參與的都做 |
+| `task` | 指定要領的任務 id | 自動挑 |
+| `loop` 或 `loop=N` | 做完一個再領下一個，最多 N 個；沒任務時每分鐘問一次，連續 5 次沒有就停 | 只做一個 |
+
+也可以用自然語言說，例如「用 agent-pm-worker 這個 Skill，以 home-pc-cc 的身分連續領任務」。
+
+應該看到：
+
+- 網頁上出現機器人 home-pc-cc 飛到節點上，節點變黃。
+- 倉庫裡多了任務分支 `project/<項目短名>/<任務 key>-<編號>`，commit 標題以 `[<項目短名>/<任務 key>]` 開頭，結尾有 `Project:`、`Task:`、`Worker:` 三行。
+- 每存一個檢查點，進度環變長，側欄「接力記錄」多一條。
+- agent 完成後節點變紫，等你或 PM agent review。有 `gh` 並且能推到 GitHub 時，它會開 PR 並把鏈接填進交付。
+
+想讓它停下：直接跟它說「停下，交出任務」，它會存檢查點並 `release_task`，任務立刻可以被別人接手。直接關掉視窗或按 Esc 的話，它來不及交接，要等 3 分鐘租約超時。
+
+想無人值守地跑（例如晚上讓家裡的電腦一直領任務），可以用非互動模式：
+
+```bash
+cd ~/code/projects_site_v01
+claude -p "/agent-pm-worker worker_id=home-pc-cc labels=code loop" --allowedTools "Bash Edit Write Monitor"
+```
+
+`--allowedTools "Bash …"` 等於允許 agent 執行任何命令，只在你信得過任務來源時這樣用。長期無人值守還是 D6 的 runner 更穩。
 
 ### D6. 讓 runner 常駐，自動啟動 agent
 
@@ -398,6 +470,46 @@ WORKER_ID=home-pc WORKER_NAME=小家 WORKER_MACHINE=家用電腦 WORKER_LABELS=c
 - agent 異常退出時，輸出裡有 usage limit、rate limit、quota、額度這類字樣就當作額度用完：存檢查點、交出任務、這台電腦冷卻 10 分鐘（`COOLDOWN_MS`）。其他異常退出回報受阻。
 - 按 `Ctrl+C` 會先停 agent、存檢查點、交出任務再退出。
 - 心跳連不上超過一個租約時長後恢復：任務還沒被別人領走就領回來繼續，已經被領走就停掉 agent 並且不再 push。
+
+### D7. Skill 和 runner 怎麼選
+
+兩種接法連的是同一個協調服務，可以混著用：有的電腦跑 runner，有的電腦用 Skill。
+
+| | Skill（D5） | runner（D6） |
+| --- | --- | --- |
+| worker 電腦要裝什麼 | Claude Code、一行 MCP 設定、一個 SKILL.md | 這個倉庫、Node 20、`npm install` |
+| 誰領任務、誰續約 | agent 自己調 MCP 工具 | runner 領取，每 1/3 個租約自動心跳，跟 agent 在做什麼無關 |
+| 任務分支和 push | agent 照 Skill 的規則自己切、自己 push | `GIT_SYNC=1` 時 runner 切好分支，每分鐘自動 commit 並 push 一次兜底 |
+| 被打斷 | 跟它說「停下」：存檢查點並交出，立刻可接手。關視窗或按 Esc：等租約超時 | `Ctrl+C`：存檢查點並交出，立刻可接手 |
+| 額度用完 | agent 中途停下，來不及交接。等租約超時後任務回到任務池，接手者從最後一個檢查點接著做 | runner 從輸出認出來，存檢查點、交出，這台電腦冷卻 |
+| 適合 | 讓新同事、新電腦快速加入；人在電腦前看著做 | 常駐、無人值守、任務裡有很長的命令 |
+
+Skill 最大的弱點是續約靠 agent 自己記得做。它被一個很長的前台命令卡住、等你批准權限、或者額度用完時，租約都可能過期。Skill 裡已經要求它把長命令放到背景、等待期間每分鐘續約；實測一個 4 分鐘的構建（租約 3 分鐘）時，agent 用 Claude Code 的 Monitor 每 30 到 40 秒喚醒自己續約一次，租約沒有斷。
+
+### D8. 我驗證過什麼，沒驗證過什麼
+
+驗證過（Linux，Claude Code 2.1.330，用非互動模式 `claude -p "/agent-pm-worker …"` 跑；協調服務開了 `PM_TOKEN` 鑒權、`LEASE_MS=180000`；MCP 用的是一個非管理員用戶的 token；origin 是本機的裸倉庫）：
+
+- **從頭做**：註冊、領取、從預設分支開任務分支、改代碼、跑測試、commit（標題以 `[calc/ops]` 開頭，結尾有 `Project:`、`Task:`、`Worker:` 三行）、`heartbeat`、push、`save_checkpoint`、`submit_result`，任務進入待 review。
+- **接手續作**：腳本扮演的 pc-a 寫完第 1、2 章後以「額度用完」交出。Claude Code 領到後切到遠端的任務分支，核對內容和檢查點一致，只寫了第 3 到 5 章，前兩章一字沒動，每章只出現一次、署名正確。
+- **真實 agent 接真實 agent**：一個 Claude Code（cc-3）寫完第一篇短文後被收回，另一個 Claude Code（cc-6）讀它的檢查點，接著寫完後三篇，沒有重寫第一篇，四個 commit 各改一個檔案。
+- **連續領取**（`loop=2`）：做完一個自動領下一個，每個任務都重新切分支。沒有可領的任務時（`loop`），它每分鐘問一次，連續 5 次都沒有就停下。
+- **重開會話時任務還在自己手上**：同一個 worker_id 在租約內重新開一個 Claude Code，`register_worker` 返回了 `current_task`，agent 用 `get_task` 查到任務還是自己的，就直接接著做，沒有再去領新任務。
+- **被接手**：agent 存了第一個檢查點後，我讓它的租約立刻過期並由另一個 worker 領走。它下一次 `heartbeat` 收到 `lease_lost`，用 `get_task` 查到任務已被接手，就停手：遠端分支一直停在它最後一次 push 的 commit，本地沒推上去的改動收進 stash。
+- **長命令續約**：任務裡有一個要跑 4 分鐘的構建，比 3 分鐘的租約長。兩次測試裡 agent 都把它放到背景，用 Monitor 每 30 到 40 秒喚醒自己續約，租約一次都沒斷，跑完後正常交付。
+- **叫它停下**：強殺 agent 進程後，接著同一個會話跟它說「我要關電腦了，請停下」。它確認分支已經 push，存了一個寫明下一步的檢查點，然後 `release_task(reason=interrupted)`，任務立刻回到任務池。
+- **權限的坑**：沒有在 `settings.json` 永久允許時，Skill 自帶的工具許可只在第一輪有效。背景命令把 agent 喚醒之後，從第二輪起 `heartbeat` 全部被拒，3 分鐘後租約過期。agent 照規則沒有 push、沒有交付，只 commit 在本地並說明原因。D5 第 3 步就是為這個加的；加上之後的幾次測試沒有再出現。
+
+沒有驗證過：
+
+- **互動模式**。測試全部是用 `claude -p` 跑的。互動模式下流程應該一樣，但我沒有人工打開 Claude Code 點過一遍。
+- **真的 GitHub 和開 PR**。origin 是本機的裸倉庫，agent 每次都判斷出開不了 PR，改在交付說明裡寫分支和 commit。`gh pr create` 那一步沒有跑過。
+- **HTTPS 和公網**。協調服務和 Claude Code 在同一台機器上，走 `http://localhost`。
+- **真的額度用完**。Claude Code 額度用完時會直接停下，來不及交接，只能等租約超時後由別人從最後一個檢查點接手。這個情況沒有真的發生過。
+- **Windows**，以及 PowerShell 的安裝命令。
+- **網頁畫面**。這次只核對了協調服務的資料和 git 倉庫，沒有截圖核對 3D 畫面。
+- **又長又複雜的真實任務**。測試任務都只要幾分鐘。任務一長，agent 能不能一直記得續約、檢查點寫得夠不夠細，要在實際使用裡觀察。
+- **沒有 Monitor 的舊版 Claude Code**。長命令的續約是靠 Monitor 做到的；舊版沒有這個工具時，agent 只能在等待中自己 `sleep` 再續約，沒有測過。
 
 ---
 
@@ -650,7 +762,7 @@ pkill -CONT -f "runner.ts"          # 終端 2：電腦A 的網路恢復
 
 沒有驗證過：
 
-- **真實的 agent**。假 agent 是「看檔案有幾章就接著寫」，真實的 Claude Code 能不能讀懂續作說明、老老實實從上一位停下的地方接著做而不是推倒重來，要靠你實測（D5、D6）。
+- **經過 runner 的真實 agent**。假 agent 是「看檔案有幾章就接著寫」。真實的 Claude Code 透過 D5 的 Skill 會照續作說明從上一位停下的地方接著做（見 D8）；經過 runner 的提示詞（D6）能不能做到，要靠你實測。
 - **真實的 usage limit 長什麼樣**。runner 現在是靠 agent 輸出裡有沒有 usage limit、rate limit、quota、額度這些字樣來判斷的（可用 `HANDOFF_PATTERN` 改）。Claude Code 真的用完額度時輸出什麼、退出碼是多少，我沒有條件試。
 - **Windows**。信號處理（Ctrl+C 的交接）和 `GIT_SYNC` 在 Windows 上沒跑過。
 - **真的兩台電腦和真的 GitHub**。E4 是同一台機器上的兩個目錄加一個本地的裸倉庫。
@@ -940,7 +1052,7 @@ claude mcp add --transport http agent-pm http://localhost:4000/mcp --header "Aut
 | 11 | 全部完成後項目交付 | PM 交付 | A2 / C7 | 檯面邊框變金色，顯示「PM 已交付」 |
 | 12 | 進度實時可見，可回放 | 可視化 | A5 / A6 | 不重新整理頁面就更新；滑桿能回到任一時刻 |
 | 13 | Agent 可經 MCP 操作 | 多 agent 接入 | B3 / D2 | MCP 測試通過；curl 能列出 16 個工具 |
-| 14 | 真實 agent 走完整流程 | 多 agent 接入 | D4 到 D6 | 這一項我沒有驗證過，需要你實測 |
+| 14 | 真實 agent 走完整流程 | 多 agent 接入 | D4 到 D6 | Worker 這一半用 D5 的 Skill 驗證過（見 D8）；PM 那一半（D4）和 runner 接真實 agent（D6）沒有驗證過，需要你實測 |
 | 15 | 中斷的任務帶著進度回到任務池 | 斷連後續作 | A2 / E1 | 節點顯示「待接手 N%」，進度環不歸零 |
 | 16 | 人工打斷後別的 worker 立刻接手，從檢查點繼續 | 斷連後續作 | C5 / E2 | 接手的 runner 顯示「跳過前 N 步」，沒有從第 1 步重來 |
 | 17 | 硬斷線（強殺、斷電）在租約超時後被接手 | 斷連後續作 | A2 / E3 | 約一個租約時長後出現「保留 N% 的進度」，接手者從那之後開始 |
@@ -948,7 +1060,7 @@ claude mcp add --transport http agent-pm http://localhost:4000/mcp --header "Aut
 | 19 | 誰做了哪一段可以追溯 | 斷連後續作 | A3 / E1 | 側欄「接力記錄」列出每個 worker 的檢查點和每次中斷的原因 |
 | 20 | 網路抖動不誤殺、不互相覆蓋 | 斷連後續作 | E5（選做） | 沒人接手時原 worker 領回繼續；有人接手時原 worker 停下且不 push |
 | 21 | 協調服務重啟後檢查點不丟 | 斷連後續作 | B3 | 「續作…協調服務重啟也不丟」測試通過 |
-| 22 | 真實 agent 斷連後被另一個真實 agent 接手 | 斷連後續作 | D5 / D6 | 這一項我沒有驗證過，需要你實測 |
+| 22 | 真實 agent 斷連後被另一個真實 agent 接手 | 斷連後續作 | D5 / D6 | 用 D5 的 Skill 驗證過（見 D8）；runner 接真實 agent（D6）沒有驗證過，需要你實測 |
 | 23 | 共用一個倉庫時，分支分得清是哪個項目的 | 一個 PM 管多個項目 | A3 / F1 | 分支都是 `project/<項目短名>/…`；`git branch --list 'project/site/*'` 只列出 site 的 |
 | 24 | commit 分得清是哪個項目的，包括 agent 自己提交的 | 一個 PM 管多個項目 | F1 | `git log --grep='Project: blog'` 列出 blog 的全部提交；除了 `init` 沒有不帶標記的提交 |
 | 25 | 優先級高的項目先拿到 worker | 一個 PM 管多個項目 | A7 / F1 | 後建立但優先級高的 site 先被領取 |
@@ -958,6 +1070,8 @@ claude mcp add --transport http agent-pm http://localhost:4000/mcp --header "Aut
 | 29 | worker 只會領主人有權參與的項目的任務 | 一個 PM 管多個項目 | F3 | Amy 的 worker 做完 site 就閒下來，不碰 blog |
 | 30 | 只有負責人能 review 和改設定 | 一個 PM 管多個項目 | A7 / F3 | 參與者 review 被拒絕；非成員得到「不存在」 |
 | 31 | 真實 agent、真實 GitHub、多人同時使用 | 一個 PM 管多個項目 | F4 | 這一項我沒有驗證過，需要你實測 |
+| 32 | Worker 不跑 runner，用 Skill 接入 | 多 agent 接入 | D5 | 輸入 `/agent-pm-worker` 後任務被領取、推到任務分支、交付；commit 帶 `[項目短名/任務 key]` 標記和三行結尾 |
+| 33 | Skill 模式下長命令不丟租約，被接手後不再 push | 斷連後續作 | D5 / D8 | 跑超過一個租約時長的命令時節點一直是黃色；被別人接手後，原來的 agent 不再往任務分支 push |
 
 ---
 
