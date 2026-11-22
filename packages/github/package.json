@@ -1,0 +1,20 @@
+{
+  "name": "@agent-pm/github",
+  "version": "0.2.0",
+  "private": true,
+  "type": "module",
+  "description": "GitHub 當中間層：hub 倉庫的讀寫、git 分支鎖、apm 命令行。不需要服務器。",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "test": "tsx --test src/*.test.ts",
+    "apm": "tsx src/cli.ts"
+  },
+  "dependencies": {
+    "@agent-pm/core": "*"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0"
+  }
+}
