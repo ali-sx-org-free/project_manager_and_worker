@@ -1,0 +1,3 @@
+#!/bin/sh
+# agent-pm 的 apm 命令。插件啟用時 Claude Code 把這個目錄放進 PATH，Skill 直接用 `apm …`
+exec node "$(dirname "$0")/../lib/apm.mjs" "$@"

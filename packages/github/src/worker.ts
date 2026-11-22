@@ -376,7 +376,7 @@ export class WorkerOps {
   }
 
   /** 把鎖往前推一步。被別人改過就拋 LeaseLost。自己的另一個進程（keepalive）剛推過的話，接著它往前推 */
-  private async writeLock(s: HeldState, status: LockStatus, extra: Partial<LockPayload> = {}): Promise<Lock> {
+  private async writeLock(s: HeldState, status: LockStatus, extra: Partial<LockPayload> = {}, touch = true): Promise<Lock> {
     await this.hub.gh.syncClock();
     const leaseMs = await this.leaseMs();
     let base: Lock = s.lock;
@@ -392,7 +392,10 @@ export class WorkerOps {
       };
       const next = await this.hub.locks.advance(base.sha, payload);
       if (next) {
-        this.state.save({ ...s, lock: next, last_activity: Date.now() });
+        // 重新讀一次本機狀態再寫：另一個 apm 進程可能剛更新過 last_activity
+        const latest = this.state.load();
+        const keep = latest && latest.task === s.task && latest.attempt === s.attempt ? latest : s;
+        this.state.save({ ...keep, lock: next, last_activity: touch ? Date.now() : keep.last_activity });
         return next;
       }
       const cur = await this.hub.locks.get(s.task);
@@ -411,9 +414,10 @@ export class WorkerOps {
     throw new Error('續約一直衝突，稍後再試');
   }
 
-  async heartbeat(): Promise<{ task: number; lease_expires_at: number; attempt: number }> {
+  /** 續約。background：apm keepalive 的自動續約，不算 agent 的活動（不然 agent 死了 keepalive 也會一直續下去） */
+  async heartbeat(opts: { background?: boolean } = {}): Promise<{ task: number; lease_expires_at: number; attempt: number }> {
     const s = this.requireHeld();
-    const l = await this.writeLock(s, 'held');
+    const l = await this.writeLock(s, 'held', {}, !opts.background);
     return { task: s.task, lease_expires_at: l.expires_at!, attempt: s.attempt };
   }
 

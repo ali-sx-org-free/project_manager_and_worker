@@ -1,0 +1,8 @@
+{
+  "name": "agent-pm",
+  "version": "0.2.0",
+  "description": "agent-pm：以 GitHub 倉庫為中間層的多 agent 項目管理。PM 拆任務、review；Worker 領任務、續作、交付。不需要服務器。",
+  "author": { "name": "ali-sx-org-free" },
+  "repository": "https://github.com/ali-sx-org-free/project_manager_and_worker",
+  "keywords": ["project-management", "multi-agent", "github"]
+}

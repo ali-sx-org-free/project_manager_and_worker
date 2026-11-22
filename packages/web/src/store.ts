@@ -12,6 +12,25 @@ export const fx = {
 
 export type Mode = 'connecting' | 'live' | 'demo' | 'denied';
 
+/** 連的是本機管理端（npm run console）時，它額外推送的 hub 狀態 */
+export interface HubInfo {
+  name: string;
+  url: string;
+  me: string;
+  admin: boolean;
+  private: boolean | null;
+  lease_minutes: number;
+  poll_ms: number;
+  last_sync: number | null;
+  syncing: boolean;
+  error: string | null;
+  rate: { limit: number; remaining: number; reset: number } | null;
+  requests: { total: number; not_modified: number };
+  locks: { task: number; title: string | null; worker: string; owner: string; attempt: number; status: string; alive: boolean; expires_at: number | null; task_open: boolean }[];
+  roster: { id: string; owner: string; labels: string[]; status: string; current_task: number | null; seen: number; machine: string }[];
+  counts: { projects: number; tasks: number; comments: number };
+}
+
 export interface World {
   projects: Record<string, Project>;
   tasks: Record<string, Task>;
@@ -33,6 +52,9 @@ interface State extends World {
   focus: string;
   /** 回放：只看前 N 個事件時的世界；null 表示實時 */
   replayIdx: number | null;
+  /** GitHub hub 的狀態（只有連本機管理端時才有） */
+  hub: HubInfo | null;
+  hubOpen: boolean;
   hello(snapshot: Snapshot, events: PmEvent[]): void;
   apply(event: PmEvent): void;
   set(patch: Partial<State>): void;
@@ -66,6 +88,8 @@ export const useStore = create<State>((set, get) => ({
   view: '3d',
   focus: 'all',
   replayIdx: null,
+  hub: null,
+  hubOpen: false,
 
   hello(snapshot, events) {
     const by = <T extends { id: string }>(arr: T[]) => Object.fromEntries(arr.map((x) => [x.id, x]));

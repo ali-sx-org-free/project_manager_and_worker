@@ -1,6 +1,6 @@
 import { Scene } from './scene/Scene.tsx';
 import { useStore } from './store.ts';
-import { Feed, Legend, ListView, SidePanel, Timeline, TopBar } from './ui/panels.tsx';
+import { Feed, HubPanel, Legend, ListView, SidePanel, Timeline, TopBar } from './ui/panels.tsx';
 
 export function App() {
   const view = useStore((s) => s.view);
@@ -23,6 +23,7 @@ export function App() {
         <ListView />
       )}
       <SidePanel />
+      <HubPanel />
     </div>
   );
 }

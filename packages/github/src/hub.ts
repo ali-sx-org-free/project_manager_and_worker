@@ -247,6 +247,8 @@ export interface HubOptions extends GitHubOptions {
   locks?: LockStore;
   /** 本機存放鎖倉庫的目錄（預設 ~/.agent-pm/git） */
   gitDir?: string;
+  /** 鎖用的 git 遠端（預設 https://github.com/<hub>.git；測試時可以是本機的裸倉庫） */
+  gitRemote?: string;
 }
 
 /** 一個 hub 倉庫：所有讀寫 GitHub 的地方都經過它 */
@@ -265,7 +267,7 @@ export class Hub {
     this.locks =
       opts.locks ??
       new GitLockStore({
-        remoteUrl: `https://github.com/${this.name}.git`,
+        remoteUrl: opts.gitRemote ?? `https://github.com/${this.name}.git`,
         dir: `${opts.gitDir ?? `${process.env.HOME ?? process.env.USERPROFILE ?? '.'}/.agent-pm/git`}/${this.repo.owner}/${this.repo.name}.git`,
         token: opts.token,
       });
@@ -415,7 +417,8 @@ export class Hub {
 
   /** 整個 hub 的留言（since 之後新增或編輯過的），管理端用它一次拿到所有變化 */
   async allComments(since?: number): Promise<CommentInfo[]> {
-    const q = `sort=updated&direction=asc${since ? `&since=${new Date(since).toISOString()}` : ''}`;
+    // 按建立時間排序：分頁穩定（按更新時間排的話，翻頁途中有人編輯留言會漏掉或重複）
+    const q = `sort=created&direction=asc${since ? `&since=${new Date(since).toISOString()}` : ''}`;
     return (await this.gh.paginate<GhComment>(`${this.base}/issues/comments?${q}`, 200))
       .map(toComment)
       .filter((c): c is CommentInfo => !!c);

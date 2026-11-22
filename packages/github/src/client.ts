@@ -50,6 +50,8 @@ export interface GitHubOptions {
   apiBase?: string;
   /** 本機時鐘，只用來量「距離上次收到 GitHub 時間過了多久」 */
   now?: () => number;
+  /** GET 帶 If-None-Match：沒變化時 GitHub 返回 304，不算 API 額度（管理端輪詢用） */
+  etags?: boolean;
 }
 
 /** GitHub REST 的薄封裝。順便記下 GitHub 的時間（每個回應的 Date 標頭），租約一律按 GitHub 的時鐘算。 */
@@ -61,8 +63,12 @@ export class GitHub {
   private offset = 0;
   private synced = false;
   rate: { limit: number; remaining: number; reset: number } | null = null;
+  private etagCache: Map<string, { etag: string; text: string }> | null;
+  /** 統計：請求數、其中 304 的數目 */
+  stats = { requests: 0, notModified: 0 };
 
   constructor(opts: GitHubOptions = {}) {
+    this.etagCache = opts.etags ? new Map() : null;
     this.apiBase = (opts.apiBase ?? 'https://api.github.com').replace(/\/$/, '');
     this.transport = opts.transport ?? fetchTransport;
     this.token = opts.token;
@@ -92,6 +98,8 @@ export class GitHub {
     };
     if (this.token) headers.authorization = `Bearer ${this.token}`;
     if (body !== undefined) headers['content-type'] = 'application/json';
+    const cached = method === 'GET' ? this.etagCache?.get(url) : undefined;
+    if (cached) headers['if-none-match'] = cached.etag;
     let res: HttpResponse | undefined;
     let lastErr: unknown;
     // 網路抖動和 5xx 重試兩次；GitHub 要求放慢（secondary rate limit）時照它說的等；其他 4xx 不重試
@@ -114,6 +122,13 @@ export class GitHub {
       await new Promise((r) => setTimeout(r, 300 * (i + 1)));
     }
     if (!res) throw new GitHubError(0, `連不上 GitHub：${lastErr instanceof Error ? lastErr.message : String(lastErr)}`);
+    this.stats.requests++;
+    if (res.status === 304 && cached) {
+      this.stats.notModified++;
+      res = { ...res, status: 200, text: cached.text };
+    } else if (method === 'GET' && this.etagCache && res.status === 200 && res.headers['etag']) {
+      this.etagCache.set(url, { etag: res.headers['etag'], text: res.text });
+    }
     const date = res.headers['date'];
     if (date) {
       const t = Date.parse(date);

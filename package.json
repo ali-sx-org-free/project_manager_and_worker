@@ -2,7 +2,7 @@
   "name": "agent-pm",
   "version": "0.1.0",
   "private": true,
-  "description": "多 agent 項目管理原型：協調服務 + MCP + Worker runner + 3D 視窗",
+  "description": "多 agent 項目管理：GitHub 倉庫當中間層（apm 命令行 + Claude Code 插件 + 本機管理端），舊的協調服務方案也還在",
   "type": "module",
   "workspaces": [
     "packages/*"
@@ -17,11 +17,17 @@
     "sim": "npm start -w @agent-pm/simulator",
     "runner": "npm start -w @agent-pm/runner --",
     "build": "npm run build -w @agent-pm/web",
-    "test": "npm test -w @agent-pm/core && npm test -w @agent-pm/server",
-    "typecheck": "tsc -p packages/core && tsc -p packages/server && tsc -p packages/simulator && tsc -p packages/runner && tsc -p packages/web"
+    "test": "npm test -w @agent-pm/core && npm test -w @agent-pm/server && npm test -w @agent-pm/github && npm test -w @agent-pm/console",
+    "typecheck": "tsc -p packages/core && tsc -p packages/server && tsc -p packages/simulator && tsc -p packages/runner && tsc -p packages/web && tsc -p packages/github && tsc -p packages/console",
+    "console": "npm start -w @agent-pm/console --",
+    "console:fake": "npm start -w @agent-pm/console -- --fake",
+    "apm": "tsx packages/github/src/cli.ts",
+    "fake-github": "tsx packages/github/src/fake-server.ts",
+    "build:apm": "node scripts/build-apm.mjs"
   },
   "devDependencies": {
     "tsx": "^4.19.0",
-    "typescript": "^5.6.0"
+    "typescript": "^5.6.0",
+    "esbuild": "^0.28.2"
   }
 }

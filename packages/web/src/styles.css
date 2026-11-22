@@ -779,3 +779,36 @@ tbody tr:last-child td {
 .mode.denied i {
   background: #ff5468;
 }
+
+/* GitHub hub（本機管理端）：頂欄的狀態按鈕和左側的 hub 面板 */
+.mode.hubbtn {
+  border: 1px solid var(--line);
+  background: transparent;
+  border-radius: 999px;
+  padding: 3px 10px;
+}
+.mode.hubbtn:hover {
+  border-color: var(--accent);
+}
+.mode.err i {
+  background: var(--bad);
+  box-shadow: 0 0 8px var(--bad);
+}
+.side.hubpanel {
+  right: auto;
+  left: 0;
+  z-index: 7;
+  border-left: none;
+  border-right: 1px solid var(--line);
+  padding-left: max(18px, env(safe-area-inset-left, 0px));
+  padding-right: 18px;
+}
+.side.hubpanel .row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 10px 0;
+}
+.side.hubpanel h2 a {
+  color: inherit;
+}
