@@ -1,0 +1,20 @@
+{
+  "name": "@agent-pm/console",
+  "version": "0.2.0",
+  "private": true,
+  "type": "module",
+  "description": "本機管理端：用你的 GitHub 登入讀寫 hub，給 3D 網頁提供和原來協調服務一樣的接口。不需要部署。",
+  "scripts": {
+    "start": "tsx src/index.ts",
+    "test": "tsx --test src/*.test.ts"
+  },
+  "dependencies": {
+    "@agent-pm/core": "*",
+    "@agent-pm/github": "*",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/ws": "^8.5.0"
+  }
+}

@@ -1,0 +1,12 @@
+{
+  "name": "agent-pm",
+  "owner": { "name": "ali-sx-org-free" },
+  "description": "agent-pm 的 Claude Code 插件：PM 和 Worker 兩個 Skill，加上 apm 命令行",
+  "plugins": [
+    {
+      "name": "agent-pm",
+      "source": "./plugin",
+      "description": "PM 和 Worker 的 Skill + apm 命令行（GitHub 當中間層，不需要服務器）"
+    }
+  ]
+}

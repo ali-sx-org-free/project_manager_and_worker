@@ -42,6 +42,8 @@ export function TopBar() {
   // 管理員（或服務沒啟用鑒權時）可以換成別人的視角，看看對方看得到什麼
   const canSwitch = !!me && (me.user.admin || !!me.acting_for);
   const others = useStore((s) => s.roster).filter((u) => !u.admin);
+  const hub = useStore((s) => s.hub);
+  const hubOpen = useStore((s) => s.hubOpen);
 
   return (
     <header className="topbar">
@@ -105,10 +107,17 @@ export function TopBar() {
             速度 ×{speed}
           </button>
         )}
-        <span className={`mode ${mode}`}>
-          <i />
-          {mode === 'live' ? '實時連線' : mode === 'demo' ? '瀏覽器內模擬' : mode === 'denied' ? 'token 無效' : '連線中…'}
-        </span>
+        {hub && mode === 'live' ? (
+          <button className={`mode live hubbtn ${hub.error ? 'err' : ''}`} onClick={() => set({ hubOpen: !hubOpen })} title="hub 狀態、鎖和 Worker 名冊">
+            <i />
+            GitHub · {hub.name}
+          </button>
+        ) : (
+          <span className={`mode ${mode}`}>
+            <i />
+            {mode === 'live' ? '實時連線' : mode === 'demo' ? '瀏覽器內模擬' : mode === 'denied' ? 'token 無效' : '連線中…'}
+          </span>
+        )}
         <div className="seg" role="tablist" aria-label="視圖">
           <button className={view === '3d' ? 'on' : ''} onClick={() => set({ view: '3d' })}>
             3D
@@ -289,7 +298,16 @@ export function SidePanel() {
       <h2>{task.title}</h2>
       <p className="muted">
         {project?.title} · <code>{task.project_key}/{task.key}</code>
+        {(task as Task & { url?: string }).url && (
+          <>
+            {' · '}
+            <a href={(task as Task & { url?: string }).url} target="_blank" rel="noreferrer">
+              在 GitHub 上打開 #{task.id}
+            </a>
+          </>
+        )}
       </p>
+      {(task as Task & { human_review?: boolean }).human_review && <p className="warn">這個任務必須由人批准（review:human）</p>}
 
       <dl>
         <dt>描述</dt>
@@ -667,5 +685,136 @@ export function ListView() {
         </div>
       </section>
     </main>
+  );
+}
+
+// ───────────────────────── GitHub hub：同步狀態、鎖、名冊（只有連本機管理端時有） ─────────────────────────
+
+const ago = (t: number | null) => {
+  if (!t) return '還沒同步';
+  const s = Math.round((Date.now() - t) / 1000);
+  return s < 60 ? `${s} 秒前` : `${Math.round(s / 60)} 分鐘前`;
+};
+
+export function HubPanel() {
+  const hub = useStore((s) => s.hub);
+  const open = useStore((s) => s.hubOpen);
+  const set = useStore((s) => s.set);
+  const [busy, setBusy] = useState('');
+  const [note, setNote] = useState('');
+  const [, tick] = useState(0);
+  useEffect(() => {
+    const t = setInterval(() => tick((x) => x + 1), 1000);
+    return () => clearInterval(t);
+  }, []);
+  if (!hub || !open) return null;
+  const run = async (label: string, path: string, body?: unknown, done?: (r: unknown) => string) => {
+    setBusy(label);
+    setNote('');
+    try {
+      const r = await backend.hub(path, body);
+      setNote(done ? done(r) : `${label}：完成`);
+    } catch (err) {
+      setNote(`${label}失敗：${err instanceof Error ? err.message : String(err)}`);
+    } finally {
+      setBusy('');
+    }
+  };
+  const live = hub.locks.filter((l) => l.status === 'held' && l.task_open);
+  const stale = hub.locks.filter((l) => !l.task_open).length;
+  return (
+    <aside className="side hubpanel" aria-label="GitHub hub">
+      <header>
+        <strong>GitHub hub</strong>
+        <button className="close" aria-label="關閉" onClick={() => set({ hubOpen: false })}>
+          ×
+        </button>
+      </header>
+      <h2>
+        <a href={hub.url} target="_blank" rel="noreferrer">
+          {hub.name}
+        </a>
+      </h2>
+      <p className="muted">
+        以 <b>{hub.me}</b> 的身分{hub.admin ? '（hub 管理員）' : ''} · 每 {Math.round(hub.poll_ms / 1000)} 秒同步 · 上次 {ago(hub.last_sync)}
+        {hub.syncing ? ' · 同步中…' : ''}
+      </p>
+      {hub.private === false && <p className="warn">hub 是公開倉庫！任務正文會被 agent 當作指令執行，請改成 Private。</p>}
+      {hub.error && <p className="warn">同步失敗：{hub.error}</p>}
+      <dl>
+        <dt>內容</dt>
+        <dd>
+          {hub.counts.projects} 個項目 · {hub.counts.tasks} 個任務 · {hub.counts.comments} 條接力記錄 · 租約 {hub.lease_minutes} 分鐘
+        </dd>
+        <dt>API 額度</dt>
+        <dd>
+          {hub.rate ? `本小時還剩 ${hub.rate.remaining} / ${hub.rate.limit}` : '—'}
+          <span className="muted">
+            {' '}
+            · 已發 {hub.requests.total} 個請求，其中 {hub.requests.not_modified} 個沒變化（不算額度）
+          </span>
+        </dd>
+      </dl>
+      <div className="actions row">
+        <button className="ghost" disabled={!!busy} onClick={() => run('同步', '/api/hub/sync')}>
+          立即同步
+        </button>
+        <button
+          className="ghost"
+          disabled={!!busy}
+          title="讓 status 標籤跟上鎖，補上在 GitHub 網頁上做的 PR review"
+          onClick={() => run('對齊', '/api/hub/reconcile', {}, (r) => `對齊：${(r as { changes: unknown[] }).changes.length} 處修正`)}
+        >
+          對齊標籤
+        </button>
+        {hub.admin && (
+          <button
+            className="ghost"
+            disabled={!!busy || !stale}
+            title="刪掉已關閉任務的鎖分支"
+            onClick={() => run('清理', '/api/hub/prune', {}, (r) => `清理：刪了 ${(r as { removed: unknown[] }).removed.length} 條鎖`)}
+          >
+            清理 {stale} 條舊鎖
+          </button>
+        )}
+      </div>
+      {note && <p className="muted">{note}</p>}
+
+      <h3>正在執行（{live.length}）</h3>
+      <ul className="history">
+        {live.length === 0 && <li className="muted">沒有</li>}
+        {live.map((l) => (
+          <li key={l.task}>
+            <i style={{ background: l.alive ? '#3ddc97' : '#ff5468' }} />
+            <span>
+              #{l.task} {l.title} · {l.worker}（{l.owner}）第 {l.attempt} 次 ·{' '}
+              {l.alive && l.expires_at ? `租約剩 ${Math.max(0, Math.round((l.expires_at - Date.now()) / 1000))} 秒` : '已過期，等人接手'}
+              {' '}
+              <button
+                className="link"
+                disabled={!!busy}
+                onClick={() => run('收回', `/api/tasks/${l.task}/revoke`, { note: '管理端收回' }, () => `已收回 #${l.task}`)}
+              >
+                收回
+              </button>
+            </span>
+          </li>
+        ))}
+      </ul>
+
+      <h3>Worker 名冊（{hub.roster.length}）</h3>
+      <ul className="history">
+        {hub.roster.length === 0 && <li className="muted">還沒有 worker 加入</li>}
+        {hub.roster.map((w) => (
+          <li key={w.id}>
+            <i style={{ background: w.status === 'left' ? '#8b98b5' : w.current_task ? '#ffd98a' : '#3ddc97' }} />
+            <span>
+              <b>{w.id}</b> · {w.owner} · {w.labels.join('、') || '無能力標籤'} · {w.status === 'left' ? '已離開' : w.current_task ? `在做 #${w.current_task}` : '閒置'} ·
+              最後出現 {ago(w.seen)}
+            </span>
+          </li>
+        ))}
+      </ul>
+    </aside>
   );
 }

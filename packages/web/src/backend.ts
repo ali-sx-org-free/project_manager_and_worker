@@ -11,7 +11,7 @@ import {
   type PmEvent,
   type Snapshot,
 } from '@agent-pm/core';
-import { useStore } from './store.ts';
+import { useStore, type HubInfo } from './store.ts';
 
 declare const __FORCE_DEMO__: boolean;
 
@@ -23,10 +23,26 @@ declare const __FORCE_DEMO__: boolean;
  *  live 模式下只有管理員（或服務沒有啟用鑒權時）能切換，過濾在服務端做。 */
 export const backend: {
   api: PmApi | null;
+  /** 本機管理端額外的接口（對齊標籤、收回任務、清理鎖、立即同步） */
+  hub: (path: string, body?: unknown) => Promise<unknown>;
   sim: Simulator | null;
   /** 換一個人的視角；null 回到自己 */
   viewAs: (userId: string | null) => void;
-} = { api: null, sim: null, viewAs: () => {} };
+} = {
+  api: null,
+  sim: null,
+  viewAs: () => {},
+  hub: async (path, body) => {
+    const res = await fetch(`${serverBase()}${path}`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body ?? {}),
+    });
+    const data = await res.json().catch(() => null);
+    if (!res.ok) throw new Error(data?.error?.message ?? `HTTP ${res.status}`);
+    return data;
+  },
+};
 
 const params = new URLSearchParams(location.search);
 
@@ -100,13 +116,16 @@ function startLive() {
     ws.onmessage = (msg) => {
       if (mine !== gen) return;
       const data = JSON.parse(msg.data) as
-        | { type: 'hello'; snapshot: Snapshot; events: PmEvent[] }
+        | { type: 'hello'; snapshot: Snapshot; events: PmEvent[]; hub?: HubInfo }
         | { type: 'event'; event: PmEvent }
+        | { type: 'hub'; hub: HubInfo }
         | { type: 'error'; message: string };
       const store = useStore.getState();
+      if (data.type === 'hub') store.set({ hub: data.hub });
       if (data.type === 'hello') {
         everConnected = true;
         store.hello(data.snapshot, data.events);
+        if (data.hub) store.set({ hub: data.hub });
         store.set(actAs ? { mode: 'live' } : { mode: 'live', roster: data.snapshot.users ?? [] });
         void api.me().then((me) => mine === gen && useStore.getState().set({ me }));
       } else if (data.type === 'event') store.apply(data.event);
