@@ -78,6 +78,7 @@ npm test            # 狀態機 + REST + MCP + WebSocket + 續作 + 多項目，
 | `packages/core` | 任務狀態機 `Engine`、權限層 `Scoped`（`access.ts`）、`Store` 介面、記憶體存儲、`PmApi`（本地 / HTTP 兩種實現）、模擬器。純 TypeScript，服務端和瀏覽器共用 |
 | `packages/server` | Express + ws + better-sqlite3。`sqliteStore.ts` 是表結構，`app.ts` 是 REST 和 WebSocket，`mcp.ts` 是 MCP 工具 |
 | `packages/runner` | Worker runner：領任務、啟動本地 agent、發心跳 |
+| `skills/agent-pm-worker` | Claude Code 的 Worker Skill：不跑 runner，讓 agent 自己透過 MCP 領取、續約、存檢查點、交付 |
 | `packages/simulator` | 通過 REST 扮演 worker 和 PM 的假數據模擬器 |
 | `packages/web` | React + react-three-fiber + drei，dagre 算 DAG 版面 |
 
@@ -239,6 +240,28 @@ claude mcp add --transport http agent-pm http://<協調服務地址>:4000/mcp
 | Worker | `register_worker` `list_ready_tasks` `claim_task` `heartbeat` `save_checkpoint` `release_task` `submit_result` `report_blocked` |
 | PM | `create_project` `list_projects` `update_project` `set_project_member` `list_tasks` `get_task` `review_task` `unblock_task` |
 
+### Worker Skill（不用 runner）
+
+worker 有兩種接法：用 Skill 讓 Claude Code 自己透過 MCP 領任務，或者跑下一節的 runner。Skill 這種接法，worker 電腦不用 clone 這個倉庫、不用 Node，只要 Claude Code：
+
+```bash
+# 1. 加 MCP（-s user：所有目錄都能用）
+claude mcp add --transport http -s user agent-pm http://<協調服務地址>:4000/mcp --header "Authorization: Bearer <token>"
+
+# 2. 裝 Skill
+mkdir -p ~/.claude/skills/agent-pm-worker
+curl -fsSL https://raw.githubusercontent.com/ali-sx-org-free/project_manager_and_worker/main/skills/agent-pm-worker/SKILL.md \
+  -o ~/.claude/skills/agent-pm-worker/SKILL.md
+
+# 3. 在 ~/.claude/settings.json 的 permissions.allow 裡加上 "mcp__agent-pm"，續約才不用每次批准
+```
+
+然後在代碼倉庫的目錄裡打開 Claude Code，輸入 `/agent-pm-worker worker_id=home-pc-cc labels=code`（加上 `loop` 就連續領）。
+
+[`skills/agent-pm-worker/SKILL.md`](skills/agent-pm-worker/SKILL.md) 把 runner 自動做的事寫成 agent 要遵守的流程：用固定的 worker_id 註冊；領取後有 `resume` 就切到任務分支接著做、不從頭來；每一小步 commit、先 `heartbeat` 確認租約、push、再 `save_checkpoint`；每分鐘左右續約一次，長命令放背景、等待期間續約；收到 `lease_lost` 立刻停手，任務還沒被別人領走就領回來，已經被領走就不再 push；最後 `submit_result`，做不下去 `report_blocked`，自己沒法繼續就先存檢查點再 `release_task`。
+
+和 runner 比，Skill 上手快，但續約靠 agent 自己記得做：它被一個很長的前台命令卡住、等人批准權限、或者額度用完時，租約可能過期，任務回到任務池由別人從最後一個檢查點接手。長期無人值守的電腦還是用 runner 更穩。完整步驟和兩者的對照見 [TUTORIAL.md 的 D5 和 D7](docs/TUTORIAL.md#d5-讓-agent-當-workerskill不用-runner)。
+
 ### Worker runner
 
 ```bash
@@ -286,7 +309,7 @@ agent 進程會收到 `PM_URL`、`PM_WORKER_ID`、`PM_PROJECT_KEY`、`PM_TASK_ID
 ## 還沒做、值得討論的地方
 
 1. **PM 本身還是模擬的**。真實的 PM agent 應該由事件觸發（新請求、有任務進 `in_review`），用 MCP 工具拆解和 review。觸發方式和 PM 跑在哪裡還沒定。
-2. **誰領取**：現在 runner 領取、agent 交付。另一種是 agent 自己通過 MCP 領取，runner 只負責喚醒。前者心跳可靠，後者 agent 可以挑任務。
+2. **誰領取**：現在兩種都有。runner 領取、agent 交付，心跳可靠；Skill 讓 agent 自己通過 MCP 領取和續約，上手快、agent 可以挑任務，但心跳要靠 agent 自己記得。要不要再加一種「runner 只負責喚醒和心跳、agent 自己領取」的折衷？
 3. **人類審批節點**：現在人和 PM 用同一個 review 接口。是否需要「必須人類批准」的任務類型？
 4. **重新拆解**：項目建立後還不能增刪任務或改依賴。PM 發現拆錯了要怎麼改圖？
 5. **身份的顆粒度**：現在是每人一個長期 token、三種項目角色。要不要接現成的登入（GitHub、公司 SSO）？PM agent 用誰的身份？token 怎麼過期和輪換？

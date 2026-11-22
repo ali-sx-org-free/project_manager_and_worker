@@ -346,6 +346,31 @@ npm run runner
 
 runner 要一直開著。服務器重啟或網絡斷掉時，它只會顯示「出錯，稍後重試」並自己重連。
 
+### 不跑 runner：用 Skill 接入
+
+不想在 worker 電腦上 clone 原型、裝 Node，可以讓 Claude Code 自己透過 MCP 領任務。這台電腦只需要 Claude Code、git 和工作倉庫的推送權限：
+
+```bash
+git clone https://github.com/ali-sx-org-free/projects_site_v01 ~/code/projects_site_v01
+
+claude mcp add --transport http -s user agent-pm https://34-12-56-78.sslip.io/mcp \
+  --header "Authorization: Bearer <這個人的 token>"
+
+mkdir -p ~/.claude/skills/agent-pm-worker
+curl -fsSL https://raw.githubusercontent.com/ali-sx-org-free/project_manager_and_worker/main/skills/agent-pm-worker/SKILL.md \
+  -o ~/.claude/skills/agent-pm-worker/SKILL.md
+```
+
+再在 `~/.claude/settings.json` 的 `permissions.allow` 裡加上 `"mcp__agent-pm"`，然後：
+
+```bash
+cd ~/code/projects_site_v01 && claude
+```
+
+在 Claude Code 裡輸入 `/agent-pm-worker worker_id=home-pc-cc labels=code`。`worker_id` 的規則和 runner 的 `WORKER_ID` 一樣：每台電腦不一樣、每次都用同一個。和 runner 不要用同一個 id。
+
+Windows 的寫法、每個參數的意思、和 runner 的差別，見 [TUTORIAL.md 的 D5 和 D7](TUTORIAL.md#d5-讓-agent-當-workerskill不用-runner)。
+
 ## 12. 讓 Claude Code 當 PM
 
 在你要當 PM 的那台電腦上：
@@ -454,6 +479,6 @@ sudo systemctl start agent-pm
 - **`apt-get` 的那幾行**（第 3 步的 `apt-get install`、第 9.3 節裝 Caddy、第 13 步裝 cron 和加定時備份）。我的測試環境連不上 Debian 和 Caddy 的軟件源，所以測試時用的是已經裝好這些工具的 Debian 12 環境。這幾行都是官方文檔的標準寫法。
 - **Let's Encrypt 真證書和 sslip.io**。測試時 Caddy 用的是給 `localhost` 的自簽證書。
 - **谷歌雲、AWS 控制台裡的操作**（防火牆、靜態 IP、SSH 登入）和服務器重啟後自動起來。
-- **Windows 上的 runner**，以及**真實的 Claude Code 透過公網連 MCP**。
+- **Windows 上的 runner**，以及**真實的 Claude Code 透過公網連 MCP**。第 11 節的 Skill 接法我只在本機對著 `http://localhost` 的協調服務跑過真實的 Claude Code（見 TUTORIAL.md 的 D8），沒有經過 HTTPS 和公網。
 
 另外，正式使用前要知道：token 不會過期；網頁的 `?token=` 會留在瀏覽器歷史裡。自己和信任的人用還行，人多了之後要再加強。
