@@ -59,6 +59,8 @@ interface FRepo {
   branches: Set<string>;
   next: number;
   allowedMerge: Set<string>;
+  /** 開 PR 時不檢查分支在不在（本機假 GitHub 用：分支推到了另一個裸倉庫，REST 這邊不知道） */
+  anyHead?: boolean;
 }
 
 const iso = (t: number | null) => (t === null ? null : new Date(t).toISOString());
@@ -128,6 +130,11 @@ export class FakeGitHub {
     const number = r.next++;
     r.pulls.set(number, { number, title, head, base: r.default_branch, state: 'open', merged: false, merged_by: null, mergeable: true, user, reviews: [], sha: `sha${number}` });
     return `https://github.com/${full}/pull/${number}`;
+  }
+
+  /** 模擬「分支已經推上去了」 */
+  pushBranch(full: string, branch: string) {
+    this.repo(full).branches.add(branch);
   }
 
   reviewPr(full: string, n: number, user: string, state: 'APPROVED' | 'CHANGES_REQUESTED', body = '') {
@@ -377,6 +384,16 @@ export class FakeGitHub {
     }
 
     // pulls
+    if (rest === '/pulls' && method === 'POST') {
+      if (!canWrite) return reply(403, { message: 'Resource not accessible' });
+      const head = String(body.head ?? '');
+      if (!r.anyHead && !r.branches.has(head)) return reply(422, { message: 'Validation Failed', errors: [{ field: 'head', code: 'invalid' }] });
+      if ([...r.pulls.values()].some((x) => x.head === head && x.state === 'open')) return reply(422, { message: `A pull request already exists for ${r.owner}:${head}.` });
+      const url = this.openPr(`${r.owner}/${r.name}`, head, String(body.title ?? head), user);
+      const pr = r.pulls.get(Number(url.split('/').pop()))!;
+      pr.base = String(body.base ?? r.default_branch);
+      return reply(201, this.pullJson(r, pr));
+    }
     if (rest === '/pulls' && method === 'GET') {
       const head = q.get('head');
       const state = q.get('state') ?? 'open';

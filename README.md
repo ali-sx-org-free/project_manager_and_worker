@@ -17,6 +17,23 @@
 | --- | --- |
 | ![檢視身分](docs/screenshots/07-view-as.png) | ![項目設定](docs/screenshots/08-project-settings.png) |
 
+## 新方案：不用服務器，GitHub 當中間層
+
+PM 和 Worker 不再連協調服務，而是都讀寫同一個私有 GitHub 倉庫（hub）：項目和任務是 Issue，接力記錄是留言，領取鎖是 `apm-lock/<編號>` 分支。
+Claude Code 用戶裝一個插件就有 `/agent-pm-pm`、`/agent-pm-worker` 兩個 Skill；管理端 `npm run console` 在本機跑，連的也是 GitHub。
+
+```
+/plugin marketplace add ali-sx-org-free/project_manager_and_worker
+/plugin install agent-pm@agent-pm
+```
+
+- 怎麼用、hub 裡的數據長什麼樣：[docs/GITHUB.md](docs/GITHUB.md)
+- 一步步驗收（11 關，前兩關不用碰 GitHub）：[docs/ACCEPTANCE.md](docs/ACCEPTANCE.md)
+
+下面是原來需要部署協調服務的版本，仍然能跑。
+
+## 原來的版本：協調服務
+
 **想一步步驗收和上手操作，請看 [docs/TUTORIAL.md](docs/TUTORIAL.md)。**
 
 **想部署到雲服務器（Debian 12）上真正使用，請看 [docs/DEPLOY.md](docs/DEPLOY.md)。**

@@ -1,6 +1,8 @@
+import { join } from 'node:path';
 import type { TaskState } from '@agent-pm/core';
 import { GitHub, type GitHubOptions } from './client.ts';
 import { GitLockStore, type LockStore } from './locks.ts';
+import { apmHome } from './local.ts';
 import { asList, asNum, parseYamlish, readBodyBlock, readCommentMeta, splitTaskBody, writeComment, type Block } from './meta.ts';
 
 export interface RepoRef {
@@ -268,7 +270,7 @@ export class Hub {
       opts.locks ??
       new GitLockStore({
         remoteUrl: opts.gitRemote ?? `https://github.com/${this.name}.git`,
-        dir: `${opts.gitDir ?? `${process.env.HOME ?? process.env.USERPROFILE ?? '.'}/.agent-pm/git`}/${this.repo.owner}/${this.repo.name}.git`,
+        dir: `${opts.gitDir ?? join(apmHome(), 'git')}/${this.repo.owner}/${this.repo.name}.git`,
         token: opts.token,
       });
   }

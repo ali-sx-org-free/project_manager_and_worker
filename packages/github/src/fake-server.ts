@@ -20,14 +20,19 @@ export interface FakeServer {
   close(): Promise<void>;
 }
 
-export async function startFakeServer(opts: { port?: number; users?: string[]; hub?: string; skewMs?: number } = {}): Promise<FakeServer> {
+export async function startFakeServer(opts: { port?: number; users?: string[]; hub?: string; skewMs?: number; repos?: string[] } = {}): Promise<FakeServer> {
   const users = opts.users ?? ['pm', 'alice', 'bob'];
   const hub = opts.hub ?? 'demo/hub';
   const gh = new FakeGitHub(Date.now());
   let skew = opts.skewMs ?? 0;
   for (const u of users) gh.addUser(u);
-  gh.addRepo(hub, { owner: users[0] });
+  gh.addRepo(hub, { owner: users[0] }).anyHead = true;
   for (const u of users.slice(1)) gh.grant(hub, u, 'push');
+  // 代碼倉庫（只在 REST 上存在，用來開 PR、合併 PR）
+  for (const r of opts.repos ?? []) {
+    gh.addRepo(r, { owner: users[0] }).anyHead = true;
+    for (const u of users.slice(1)) gh.grant(r, u, 'push');
+  }
   const dir = mkdtempSync(join(tmpdir(), 'apm-fake-'));
   const lockRemote = join(dir, 'hub.git');
   execFileSync('git', ['init', '--bare', '-q', lockRemote]);
@@ -80,6 +85,7 @@ if (isMain) {
     port: Number(arg('port') ?? 4010),
     users: arg('users')?.split(','),
     hub: arg('hub'),
+    repos: arg('repos')?.split(','),
   });
   console.log(`假 GitHub 在 ${s.url}，hub ${s.hub}，鎖倉庫 ${s.lockRemote}`);
   for (const u of arg('users')?.split(',') ?? ['pm', 'alice', 'bob']) {

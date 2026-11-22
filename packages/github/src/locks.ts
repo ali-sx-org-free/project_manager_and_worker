@@ -134,7 +134,7 @@ export interface GitLockStoreOptions {
 /** 推送被拒絕是「比較並交換失敗」，不是錯誤 */
 const CONFLICT_RE = /stale info|cannot lock ref|fetch first|non-fast-forward|already exists|\[rejected\]|\[remote rejected\]/i;
 const AUTH_RE = /HTTP 40[13]|Permission to .* denied|Authentication failed|could not read Username|terminal prompts disabled|Repository not found/i;
-const LOCAL_LOCK_RE = /Unable to create .*\.lock|cannot lock ref '?refs\/apm|could not lock config file|shallow.*lock/i;
+const LOCAL_LOCK_RE = /Unable to create .*\.lock|cannot lock ref '?refs\/apm|could not lock config file|shallow.*lock|shallow file has changed/i;
 
 export class GitLockStore implements LockStore {
   private ready: Promise<void> | null = null;
@@ -185,10 +185,10 @@ export class GitLockStore implements LockStore {
   /** 本機並行的 apm 進程（例如 keepalive 和 checkpoint）可能同時改本機的 ref，碰到檔案鎖就稍等重試 */
   private async gitRetry(args: string[], input?: string, extraEnv?: NodeJS.ProcessEnv): Promise<GitResult> {
     let r: GitResult = { code: 1, stdout: '', stderr: '' };
-    for (let i = 0; i < 5; i++) {
+    for (let i = 0; i < 12; i++) {
       r = await this.git(args, input, extraEnv);
       if (r.code === 0 || !LOCAL_LOCK_RE.test(r.stderr)) return r;
-      await new Promise((res) => setTimeout(res, 100 + Math.random() * 400));
+      await new Promise((res) => setTimeout(res, 100 + Math.random() * (200 + i * 150)));
     }
     return r;
   }

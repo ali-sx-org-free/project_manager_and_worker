@@ -127,16 +127,10 @@ fi
 
 1. 對照 `acceptance` 逐條自查，該跑的測試跑一遍。
 2. 最後一次 commit、`apm heartbeat`、push。
-3. 寫代碼的任務開 PR：
-
-   ```bash
-   gh pr create --repo <git.repo> --head "$B" --base <基礎分支> --title "<git.pr_title>" --body "<做了什麼、怎麼驗證>
-
-   <git.pr_body_footer>"
-   ```
-
-   開不了 PR（沒有 `gh`、沒權限），就在 summary 裡寫上分支和 commit，不要卡在這裡。
-4. `apm submit --summary "做了什麼；逐條對照驗收標準的結果；分支和 commit" --pr <PR 網址>`。不給 `--pr` 時 apm 會按任務分支自己找。任務進入待 review，你就不再持有它了，`keepalive` 會自己退出。
+3. `apm submit --summary "做了什麼；逐條對照驗收標準的結果；分支和最後的 commit"`。
+   - 寫代碼的任務：任務分支上還沒有 PR 時，**apm 會自己用任務分支開一個**（標題是 `git.pr_title`，正文是你的 summary 加 `git.pr_body_footer`，目標是 `git.base` 或預設分支），返回的 `pr_url` 就是它。想自己寫 PR 說明的話，先 `gh pr create --repo <git.repo> --head "$B" …`，再把網址傳給 `--pr`。
+   - 返回裡有 `pr_error` 而這是寫代碼的任務：多半是分支沒推上去。檢查 `git push` 的結果，在回報裡告訴使用者。
+   - 交付後任務進入待 review，你就不再持有它了，`keepalive` 會自己退出。
 
 **受阻**（任務本身做不下去：缺權限、缺資料、需要人類決定）：commit、`apm heartbeat`、push、存檢查點，然後 `apm block --reason "缺什麼、需要誰做什麼決定"`。
 
@@ -170,4 +164,4 @@ apm release --reason <原因> --note "停在哪裡、有什麼要注意的坑"
 
 ## 9. 回報給使用者
 
-每個任務結束時用幾行話告訴使用者：worker id、任務（項目短名、編號和標題，附任務 Issue 的鏈接）、是從頭做還是接手（從百分之幾）、結果（已交付 / 受阻 / 已交出 / 被接手）、分支和 PR 鏈接，還有第 4、7 節 stash 起來的改動（如果有）。
+每個任務結束時，用使用者跟你說話的語言，幾行話告訴使用者：worker id、任務（項目短名、編號和標題，附任務 Issue 的鏈接）、是從頭做還是接手（從百分之幾）、結果（已交付 / 受阻 / 已交出 / 被接手）、分支和 PR 鏈接，還有第 4、7 節 stash 起來的改動（如果有）。

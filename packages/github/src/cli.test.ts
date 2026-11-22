@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { mkdtempSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { after, before, test } from 'node:test';
@@ -22,17 +22,26 @@ after(async () => {
   await fake.close();
 });
 
-function apm(login: string, workerId: string, args: string[]): Promise<{ code: number; json: Record<string, unknown> & { [k: string]: unknown }; stdout: string; stderr: string }> {
+type Run = { code: number; json: Record<string, unknown> & { [k: string]: unknown }; stdout: string; stderr: string };
+
+function apm(login: string, workerId: string, args: string[]): Promise<Run> {
+  return apmIn(join(tmp, workerId), login, workerId, args);
+}
+
+/** workerId 為 null：不設 APM_WORKER_ID（用設定裡的 id） */
+function apmIn(home: string, login: string, workerId: string | null, args: string[]): Promise<Run> {
   return new Promise((res) => {
+    const env: NodeJS.ProcessEnv = {
+      ...process.env,
+      ...fake.env(login),
+      APM_HOME: home,
+      NO_PROXY: '127.0.0.1,localhost',
+      no_proxy: '127.0.0.1,localhost',
+    };
+    if (workerId) env.APM_WORKER_ID = workerId;
+    else delete env.APM_WORKER_ID;
     const p = spawn(process.execPath, [tsx, cli, ...args, '--json'], {
-      env: {
-        ...process.env,
-        ...fake.env(login),
-        APM_HOME: join(tmp, workerId),
-        APM_WORKER_ID: workerId,
-        NO_PROXY: '127.0.0.1,localhost',
-        no_proxy: '127.0.0.1,localhost',
-      },
+      env,
       stdio: ['ignore', 'pipe', 'pipe'],
     });
     let stdout = '';
@@ -139,4 +148,20 @@ test('apm 端到端：init → 建項目 → 多進程搶任務 → 檢查點 �
   assert.ok((locks.json as unknown as unknown[]).length >= 3);
   const doctor = await apm('alice', 'w1', ['doctor']);
   assert.match(doctor.stdout, /讀取鎖/);
+});
+
+test('同一台電腦用 APM_WORKER_ID 開第二個 worker：不寫進設定，--forget 也不刪主設定', { timeout: 60_000 }, async () => {
+  const home = join(tmp, 'shared-home');
+  const main = await apmIn(home, 'carol', null, ['join', '--labels', 'docs', '--id', 'carol-pc']);
+  assert.equal(main.code, 0, main.stdout + main.stderr);
+  const second = await apmIn(home, 'carol', 'carol-pc-2', ['join']);
+  assert.equal(second.code, 0, second.stdout + second.stderr);
+  assert.equal((second.json.worker as { id: string }).id, 'carol-pc-2');
+  const cfg = () => JSON.parse(readFileSync(join(home, 'config.json'), 'utf8')) as { worker?: { id?: string; labels?: string[] } };
+  assert.equal(cfg().worker?.id, 'carol-pc');
+  const left = await apmIn(home, 'carol', 'carol-pc-2', ['leave', '--forget']);
+  assert.equal(left.code, 0, left.stdout + left.stderr);
+  assert.equal(left.json.config_removed, false);
+  assert.deepEqual(cfg().worker?.labels, ['docs']);
+  assert.equal(cfg().worker?.id, 'carol-pc');
 });

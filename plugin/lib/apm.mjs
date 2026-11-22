@@ -5,7 +5,7 @@
 import { spawnSync } from "node:child_process";
 import { chmodSync, copyFileSync, existsSync as existsSync3, mkdirSync as mkdirSync3, readFileSync as readFileSync2, writeFileSync as writeFileSync2 } from "node:fs";
 import { homedir as homedir2, hostname as hostname2 } from "node:os";
-import { dirname as dirname3, join as join3, resolve } from "node:path";
+import { dirname as dirname3, join as join4, resolve } from "node:path";
 
 // packages/github/src/client.ts
 import { execFileSync } from "node:child_process";
@@ -163,6 +163,9 @@ var GitHub = class {
   }
 };
 
+// packages/github/src/hub.ts
+import { join as join2 } from "node:path";
+
 // packages/github/src/locks.ts
 import { spawn } from "node:child_process";
 import { existsSync, mkdirSync } from "node:fs";
@@ -230,7 +233,7 @@ var MemoryLockStore = class {
 var EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
 var CONFLICT_RE = /stale info|cannot lock ref|fetch first|non-fast-forward|already exists|\[rejected\]|\[remote rejected\]/i;
 var AUTH_RE = /HTTP 40[13]|Permission to .* denied|Authentication failed|could not read Username|terminal prompts disabled|Repository not found/i;
-var LOCAL_LOCK_RE = /Unable to create .*\.lock|cannot lock ref '?refs\/apm|could not lock config file|shallow.*lock/i;
+var LOCAL_LOCK_RE = /Unable to create .*\.lock|cannot lock ref '?refs\/apm|could not lock config file|shallow.*lock|shallow file has changed/i;
 var GitLockStore = class {
   constructor(opts) {
     this.opts = opts;
@@ -279,10 +282,10 @@ var GitLockStore = class {
   /** 本機並行的 apm 進程（例如 keepalive 和 checkpoint）可能同時改本機的 ref，碰到檔案鎖就稍等重試 */
   async gitRetry(args, input, extraEnv) {
     let r = { code: 1, stdout: "", stderr: "" };
-    for (let i = 0; i < 5; i++) {
+    for (let i = 0; i < 12; i++) {
       r = await this.git(args, input, extraEnv);
       if (r.code === 0 || !LOCAL_LOCK_RE.test(r.stderr)) return r;
-      await new Promise((res) => setTimeout(res, 100 + Math.random() * 400));
+      await new Promise((res) => setTimeout(res, 100 + Math.random() * (200 + i * 150)));
     }
     return r;
   }
@@ -447,6 +450,49 @@ ${r.stderr}`) && !AUTH_RE.test(r.stderr)) return false;
     if (CONFLICT_RE.test(`${r.stdout}
 ${r.stderr}`)) return "exists";
     throw this.fail("\u521D\u59CB\u5316 hub", r);
+  }
+};
+
+// packages/github/src/local.ts
+import { existsSync as existsSync2, mkdirSync as mkdirSync2, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { homedir, hostname } from "node:os";
+import { dirname as dirname2, join } from "node:path";
+var apmHome = () => process.env.APM_HOME || join(homedir(), ".agent-pm");
+function readJson(path) {
+  try {
+    return JSON.parse(readFileSync(path, "utf8"));
+  } catch {
+    return null;
+  }
+}
+function writeJson(path, data) {
+  mkdirSync2(dirname2(path), { recursive: true });
+  const tmp = `${path}.${process.pid}.tmp`;
+  writeFileSync(tmp, JSON.stringify(data, null, 2) + "\n");
+  renameSync(tmp, path);
+}
+var configPath = () => join(apmHome(), "config.json");
+var loadConfig = () => readJson(configPath()) ?? {};
+var saveConfig = (c) => writeJson(configPath(), c);
+var defaultWorkerId = () => process.env.APM_WORKER_ID || hostname().toLowerCase().replace(/\.local$/, "").replace(/[^a-z0-9-]+/g, "-").replace(/^-+|-+$/g, "") || "worker";
+var StateFile = class {
+  path;
+  constructor(hub, worker) {
+    this.path = join(apmHome(), "state", hub.replace("/", "__"), `${worker}.json`);
+  }
+  load() {
+    return existsSync2(this.path) ? readJson(this.path) : null;
+  }
+  save(s) {
+    writeJson(this.path, s);
+  }
+  clear() {
+    rmSync(this.path, { force: true });
+  }
+  /** 記下「agent 剛剛還在動」 */
+  touch() {
+    const s = this.load();
+    if (s) this.save({ ...s, last_activity: Date.now() });
   }
 };
 
@@ -691,7 +737,7 @@ var Hub = class {
     this.gh = new GitHub(opts);
     this.locks = opts.locks ?? new GitLockStore({
       remoteUrl: opts.gitRemote ?? `https://github.com/${this.name}.git`,
-      dir: `${opts.gitDir ?? `${process.env.HOME ?? process.env.USERPROFILE ?? "."}/.agent-pm/git`}/${this.repo.owner}/${this.repo.name}.git`,
+      dir: `${opts.gitDir ?? join2(apmHome(), "git")}/${this.repo.owner}/${this.repo.name}.git`,
       token: opts.token
     });
   }
@@ -848,49 +894,6 @@ var Hub = class {
   }
 };
 
-// packages/github/src/local.ts
-import { existsSync as existsSync2, mkdirSync as mkdirSync2, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
-import { homedir, hostname } from "node:os";
-import { dirname as dirname2, join } from "node:path";
-var apmHome = () => process.env.APM_HOME || join(homedir(), ".agent-pm");
-function readJson(path) {
-  try {
-    return JSON.parse(readFileSync(path, "utf8"));
-  } catch {
-    return null;
-  }
-}
-function writeJson(path, data) {
-  mkdirSync2(dirname2(path), { recursive: true });
-  const tmp = `${path}.${process.pid}.tmp`;
-  writeFileSync(tmp, JSON.stringify(data, null, 2) + "\n");
-  renameSync(tmp, path);
-}
-var configPath = () => join(apmHome(), "config.json");
-var loadConfig = () => readJson(configPath()) ?? {};
-var saveConfig = (c) => writeJson(configPath(), c);
-var defaultWorkerId = () => process.env.APM_WORKER_ID || hostname().toLowerCase().replace(/\.local$/, "").replace(/[^a-z0-9-]+/g, "-").replace(/^-+|-+$/g, "") || "worker";
-var StateFile = class {
-  path;
-  constructor(hub, worker) {
-    this.path = join(apmHome(), "state", hub.replace("/", "__"), `${worker}.json`);
-  }
-  load() {
-    return existsSync2(this.path) ? readJson(this.path) : null;
-  }
-  save(s) {
-    writeJson(this.path, s);
-  }
-  clear() {
-    rmSync(this.path, { force: true });
-  }
-  /** 記下「agent 剛剛還在動」 */
-  touch() {
-    const s = this.load();
-    if (s) this.save({ ...s, last_activity: Date.now() });
-  }
-};
-
 // packages/core/src/types.ts
 var PmError = class extends Error {
   constructor(code, message) {
@@ -1014,6 +1017,7 @@ function replay(entries) {
         r.last_assignee = m.worker;
         r.progress = 100;
         r.result = { summary: m.summary, pr_url: m.pr_url || void 0, submitted_by: m.worker, submitted_at: e.at };
+        log({ kind: "checkpoint", worker_id: m.worker, attempt: m.attempt, at: e.at, summary: `\u4EA4\u4ED8\uFF1A${m.summary}`, progress: 100 });
         break;
       }
       case "blocked": {
@@ -1557,6 +1561,10 @@ var WorkerOps = class {
       comment_id: c.id,
       branch,
       code_repo: codeRepo,
+      base: p.base,
+      pr_title: `[${p.key}/${t.key}] ${t.title}`,
+      pr_footer: `Project: ${p.key}
+Task: ${this.hub.name}#${t.number}`,
       claimed_at: now,
       last_activity: Date.now()
     };
@@ -1688,7 +1696,15 @@ Task: ${taskRef}`
     if (!r.summary?.trim()) throw new Error("\u4EA4\u4ED8\u9700\u8981 --summary\uFF1A\u505A\u4E86\u4EC0\u9EBC\u3001\u600E\u9EBC\u9A57\u8B49\u3001\u5C0D\u7167\u9A57\u6536\u6A19\u6E96\u7684\u7D50\u679C");
     const s = this.requireHeld();
     await this.writeLock(s, "submitted");
-    const pr = r.pr_url || await this.findPr(s);
+    let pr = r.pr_url || await this.findPr(s);
+    let created = false;
+    let prError;
+    if (!pr && r.open_pr !== false) {
+      const o = await this.openPr(s, r.summary.trim());
+      pr = o.url;
+      created = !!o.url;
+      prError = o.error;
+    }
     const meta = { kind: "submitted", attempt: s.attempt, worker: this.me.id, summary: r.summary.trim(), pr_url: pr ?? void 0, at: this.hub.now() };
     await this.hub.comment(
       s.task,
@@ -1702,7 +1718,24 @@ ${r.summary.trim()}`
     const t = await this.hub.task(s.task);
     await this.hub.setStatus(t, "in_review");
     await this.finish(s);
-    return { task: s.task, pr_url: pr, url: t.url };
+    return { task: s.task, pr_url: pr, pr_created: created, ...prError ? { pr_error: prError } : {}, url: t.url };
+  }
+  async openPr(s, summary) {
+    try {
+      const base = s.base || (await this.hub.gh.get(`/repos/${s.code_repo}`)).default_branch;
+      const pr = await this.hub.gh.post(`/repos/${s.code_repo}/pulls`, {
+        title: s.pr_title ?? `[${s.project_key}] ${s.title}`,
+        head: s.branch,
+        base,
+        body: `${summary}
+
+${s.pr_footer ?? `Task: ${this.hub.name}#${s.task}`}`
+      });
+      return { url: pr.html_url };
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      return { url: null, error: /No commits between|head|not found|Validation Failed/i.test(msg) ? `\u5206\u652F ${s.branch} \u5728 ${s.code_repo} \u4E0A\u6C92\u6709\u65B0\u7684 commit\uFF0C\u6C92\u6709\u958B PR` : msg };
+    }
   }
   async block(reason) {
     if (!reason?.trim()) throw new Error("\u9700\u8981 --reason\uFF1A\u7F3A\u4EC0\u9EBC\u3001\u9700\u8981\u8AB0\u505A\u4EC0\u9EBC\u6C7A\u5B9A");
@@ -2607,7 +2640,7 @@ function hubReadme(hub) {
 // packages/github/src/selftest.ts
 import { mkdtempSync, rmSync as rmSync2 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join as join2 } from "node:path";
+import { join as join3 } from "node:path";
 
 // packages/github/src/fake.ts
 var iso = (t) => t === null ? null : new Date(t).toISOString();
@@ -2669,6 +2702,10 @@ var FakeGitHub = class {
     const number = r.next++;
     r.pulls.set(number, { number, title, head, base: r.default_branch, state: "open", merged: false, merged_by: null, mergeable: true, user, reviews: [], sha: `sha${number}` });
     return `https://github.com/${full}/pull/${number}`;
+  }
+  /** 模擬「分支已經推上去了」 */
+  pushBranch(full, branch) {
+    this.repo(full).branches.add(branch);
   }
   reviewPr(full, n, user, state, body = "") {
     this.repo(full).pulls.get(n).reviews.push({ user, state, body, submitted_at: this.clock });
@@ -2894,6 +2931,16 @@ var FakeGitHub = class {
         return reply(201, this.issueJson(r, i));
       }
     }
+    if (rest === "/pulls" && method === "POST") {
+      if (!canWrite) return reply(403, { message: "Resource not accessible" });
+      const head = String(body.head ?? "");
+      if (!r.anyHead && !r.branches.has(head)) return reply(422, { message: "Validation Failed", errors: [{ field: "head", code: "invalid" }] });
+      if ([...r.pulls.values()].some((x) => x.head === head && x.state === "open")) return reply(422, { message: `A pull request already exists for ${r.owner}:${head}.` });
+      const url = this.openPr(`${r.owner}/${r.name}`, head, String(body.title ?? head), user);
+      const pr = r.pulls.get(Number(url.split("/").pop()));
+      pr.base = String(body.base ?? r.default_branch);
+      return reply(201, this.pullJson(r, pr));
+    }
     if (rest === "/pulls" && method === "GET") {
       const head = q.get("head");
       const state = q.get("state") ?? "open";
@@ -2983,7 +3030,7 @@ var FakeGitHub = class {
 async function selftest() {
   const steps = [];
   const prevHome = process.env.APM_HOME;
-  const home = mkdtempSync(join2(tmpdir(), "apm-selftest-"));
+  const home = mkdtempSync(join3(tmpdir(), "apm-selftest-"));
   process.env.APM_HOME = home;
   const step = async (name, fn) => {
     try {
@@ -3116,7 +3163,8 @@ var BOOL = /* @__PURE__ */ new Set([
   "launcher",
   "link",
   "prs",
-  "yes"
+  "yes",
+  "open-pr"
 ]);
 function parseArgs(argv) {
   const pos = [];
@@ -3227,8 +3275,9 @@ function makeCtx(args) {
     }
   };
 }
-var tty = () => !!process.stdout.isTTY;
 var forceJson = false;
+var forceText = false;
+var tty = () => forceText || !!process.stdout.isTTY;
 function out(data, text) {
   if (text && tty() && !forceJson) process.stdout.write(text() + "\n");
   else process.stdout.write(JSON.stringify(data, null, 2) + "\n");
@@ -3253,7 +3302,7 @@ function selfPath() {
 }
 function installLauncher(link) {
   const home = apmHome();
-  const binDir = join3(home, "bin");
+  const binDir = join4(home, "bin");
   mkdirSync3(binDir, { recursive: true });
   const me = selfPath();
   let cmd;
@@ -3261,27 +3310,27 @@ function installLauncher(link) {
   if (me.endsWith(".ts")) {
     mode = "dev";
     const root = resolve(dirname3(me), "../../..");
-    cmd = `"${process.execPath}" "${join3(root, "node_modules/tsx/dist/cli.mjs")}" "${me}"`;
+    cmd = `"${process.execPath}" "${join4(root, "node_modules/tsx/dist/cli.mjs")}" "${me}"`;
   } else {
-    const lib = join3(home, "lib");
+    const lib = join4(home, "lib");
     mkdirSync3(lib, { recursive: true });
-    copyFileSync(me, join3(lib, "apm.mjs"));
-    cmd = `node "${join3(lib, "apm.mjs")}"`;
+    copyFileSync(me, join4(lib, "apm.mjs"));
+    cmd = `node "${join4(lib, "apm.mjs")}"`;
   }
-  const sh = join3(binDir, "apm");
+  const sh = join4(binDir, "apm");
   writeFileSync2(sh, `#!/bin/sh
 # agent-pm \u7684 apm \u555F\u52D5\u5668\uFF08apm setup \u751F\u6210\uFF09
 exec ${cmd} "$@"
 `);
   chmodSync(sh, 493);
-  writeFileSync2(join3(binDir, "apm.cmd"), `@echo off\r
+  writeFileSync2(join4(binDir, "apm.cmd"), `@echo off\r
 ${cmd.replace(/\//g, "\\")} %*\r
 `);
   let linked = null;
   if (link) {
-    const local = join3(homedir2(), ".local", "bin");
+    const local = join4(homedir2(), ".local", "bin");
     mkdirSync3(local, { recursive: true });
-    const target = join3(local, "apm");
+    const target = join4(local, "apm");
     writeFileSync2(target, `#!/bin/sh
 exec "${sh}" "$@"
 `);
@@ -3292,7 +3341,7 @@ exec "${sh}" "$@"
 }
 var RULES = (bin) => ["Bash(apm *)", "Bash(apm:*)", `Bash(${bin} *)`];
 function claudeSettingsPath() {
-  return join3(process.env.CLAUDE_CONFIG_DIR || join3(homedir2(), ".claude"), "settings.json");
+  return join4(process.env.CLAUDE_CONFIG_DIR || join4(homedir2(), ".claude"), "settings.json");
 }
 function allowInClaude(bin) {
   const path = claudeSettingsPath();
@@ -3379,7 +3428,7 @@ Worker
   apm keepalive                  \u5728\u5F8C\u53F0\u8DD1\uFF1A\u5B9A\u6642\u7E8C\u7D04\uFF0C\u4EFB\u52D9\u7D50\u675F\u6216\u88AB\u63A5\u624B\u6642\u9000\u51FA
   apm heartbeat                  \u624B\u52D5\u7E8C\u7D04
   apm checkpoint --summary "\u2026" [--next "\u2026"] [--progress 60] [--commit abc123] [--artifact \u8DEF\u5F91]
-  apm submit --summary "\u2026" [--pr \u7DB2\u5740]
+  apm submit --summary "\u2026" [--pr \u7DB2\u5740] [--no-open-pr]   \u9084\u6C92\u6709 PR \u6642\u81EA\u52D5\u7528\u4EFB\u52D9\u5206\u652F\u958B\u4E00\u500B
   apm block --reason "\u2026"
   apm release [--reason usage_limit|interrupted|released|error] [--note "\u4EA4\u63A5\u8AAA\u660E"]
   apm current                    \u624B\u4E0A\u7684\u4EFB\u52D9
@@ -3404,7 +3453,7 @@ PM
   apm locks [prune [--dry-run]]
   apm invite <\u5E33\u865F> [--permission push]   apm uninvite <\u5E33\u865F>   apm members
 
-\u901A\u7528\u53C3\u6578\uFF1A--hub owner/repo  --worker <id>  --json
+\u901A\u7528\u53C3\u6578\uFF1A--hub owner/repo  --worker <id>  --json\uFF08\u5F37\u5236 JSON\uFF09  --text\uFF08\u5F37\u5236\u4EBA\u770B\u7684\u683C\u5F0F\uFF09
 \u9000\u51FA\u78BC\uFF1A0 \u6210\u529F \xB7 1 \u51FA\u932F \xB7 2 \u6C92\u6709\u4EFB\u52D9 \xB7 3 \u79DF\u7D04\u5DF2\u4E0D\u5C6C\u65BC\u4F60\uFF08\u7ACB\u523B\u505C\u624B\uFF09`;
 var commands = {
   async help() {
@@ -3428,10 +3477,10 @@ ${r.ok ? "\u5168\u90E8\u901A\u904E" : "\u6709\u5931\u6557"}`);
     applyWorkerFlags(cfg, f);
     saveConfig(cfg);
     const ctx2 = makeCtx({ ...ctx.args, flags: { ...f, hub: cfg.hub ?? "" } });
-    const result = { config: join3(apmHome(), "config.json"), hub: cfg.hub ?? null, worker: cfg.worker };
+    const result = { config: join4(apmHome(), "config.json"), hub: cfg.hub ?? null, worker: cfg.worker };
     if (f.launcher !== false) result.launcher = installLauncher(f.link === true);
     if (f.permissions !== false) {
-      const bin = result.launcher?.bin ?? join3(apmHome(), "bin", "apm");
+      const bin = result.launcher?.bin ?? join4(apmHome(), "bin", "apm");
       result.permissions = allowInClaude(bin);
     }
     const cs = await checks(ctx2, true);
@@ -3443,6 +3492,7 @@ ${r.ok ? "\u5168\u90E8\u901A\u904E" : "\u6709\u5931\u6557"}`);
       return [
         `\u672C\u6A5F\u8A2D\u5B9A\uFF1A${result.config}`,
         l ? `\u555F\u52D5\u5668\uFF1A${l.bin}${l.linked ? `\uFF08\u4E5F\u653E\u5230\u4E86 ${l.linked}\uFF09` : ""}` : "",
+        l && !l.linked && !onPath(dirname3(l.bin)) ? `  \u5728\u7D42\u7AEF\u88E1\u76F4\u63A5\u6253 apm\uFF1A\u628A\u5B83\u52A0\u9032 PATH\uFF0C\u4F8B\u5982\u5728 ~/.zshrc \u6216 ~/.bashrc \u52A0\u4E00\u884C export PATH="${dirname3(l.bin)}:$PATH"\uFF0C\u6216\u91CD\u8DD1 apm setup --link` : "",
         p ? p.error ? `\u6B0A\u9650\uFF1A${p.error}` : `Claude Code \u6B0A\u9650\uFF1A${p.added.length ? `\u5728 ${p.path} \u52A0\u4E0A ${p.added.join("\u3001")}` : "\u5DF2\u7D93\u6709\u4E86"}` : "",
         "",
         checksText(cs)
@@ -3483,12 +3533,14 @@ ${r.ok ? "\u5168\u90E8\u901A\u904E" : "\u6709\u5931\u6557"}`);
   async join(ctx) {
     const cfg = { ...ctx.cfg, worker: { ...ctx.cfg.worker } };
     applyWorkerFlags(cfg, ctx.args.flags);
-    if (!cfg.worker.id) cfg.worker.id = str(ctx.args.flags, "worker") || process.env.APM_WORKER_ID || defaultWorkerId();
+    const transient = str(ctx.args.flags, "worker") || process.env.APM_WORKER_ID;
+    if (!cfg.worker.id && !transient) cfg.worker.id = defaultWorkerId();
     saveConfig(cfg);
-    const w = await makeCtx({ ...ctx.args, flags: { ...ctx.args.flags, worker: cfg.worker.id } }).worker();
+    const id = str(ctx.args.flags, "id") || transient || cfg.worker.id || defaultWorkerId();
+    const w = await makeCtx({ ...ctx.args, flags: { ...ctx.args.flags, worker: id } }).worker();
     const meta = await w.join();
     out(
-      { worker: meta, config: join3(apmHome(), "config.json") },
+      { worker: meta, config: join4(apmHome(), "config.json") },
       () => `\u5DF2\u52A0\u5165 ${w.hub.name}\uFF1A${meta.id}\uFF08${meta.owner}\uFF09\uFF0C\u80FD\u529B ${meta.labels.join("\u3001") || "\uFF08\u7121\uFF09"}${meta.projects?.length ? `\uFF0C\u53EA\u505A ${meta.projects.join("\u3001")}` : ""}`
     );
   },
@@ -3504,15 +3556,20 @@ ${r.ok ? "\u5168\u90E8\u901A\u904E" : "\u6709\u5931\u6557"}`);
       }
     }
     w.state.clear();
+    let dropped = false;
     if (ctx.args.flags.forget === true) {
       await w.forget();
-      const cfg = { ...ctx.cfg };
-      delete cfg.worker;
-      saveConfig(cfg);
+      const mainId = ctx.cfg.worker?.id;
+      dropped = !mainId || mainId === w.me.id;
+      if (dropped) {
+        const cfg = { ...ctx.cfg };
+        delete cfg.worker;
+        saveConfig(cfg);
+      }
     } else await w.updateRoster({ status: "left", current_task: null });
     out(
-      { left: w.me.id, released, forgot: ctx.args.flags.forget === true },
-      () => `${w.me.id} \u5DF2\u96E2\u958B${released ? `\uFF0C\u4EA4\u51FA\u4E86 #${released}` : ""}${ctx.args.flags.forget === true ? "\uFF0C\u540D\u518A\u8A18\u9304\u548C\u672C\u6A5F\u8A2D\u5B9A\u5DF2\u522A\u9664" : ""}`
+      { left: w.me.id, released, forgot: ctx.args.flags.forget === true, config_removed: dropped },
+      () => `${w.me.id} \u5DF2\u96E2\u958B${released ? `\uFF0C\u4EA4\u51FA\u4E86 #${released}` : ""}${ctx.args.flags.forget === true ? `\uFF0C\u540D\u518A\u8A18\u9304${dropped ? "\u548C\u672C\u6A5F\u7684 worker \u8A2D\u5B9A" : ""}\u5DF2\u522A\u9664` : ""}`
     );
   },
   async list(ctx) {
@@ -3554,6 +3611,7 @@ ${why.slice(0, 10).map((x) => `#${x.number}\uFF1A${x.reason}`).join("\n")}` : ""
         r.resume ? `\u7E8C\u4F5C\uFF1A\u4E0A\u4E00\u4F4D ${r.resume.from_worker ?? "\u2014"} \u505A\u5230 ${r.resume.progress}%\uFF08${r.resume.reason ?? ""}\uFF09
   ${r.resume.summary}
   \u63A5\u4E0B\u4F86\uFF1A${r.resume.next_steps ?? "\u2014"}` : "\u5F9E\u982D\u958B\u59CB",
+        ...r.reviews.at(-1)?.decision === "reject" ? [`\u88AB\u9000\u56DE\uFF1A${r.reviews.at(-1).comment || "\uFF08\u6C92\u6709\u8AAA\u660E\uFF09"}\uFF08${r.reviews.at(-1).reviewer}\uFF09`] : [],
         `\u4EE3\u78BC\u5009\u5EAB ${r.git.repo}${local ? `\uFF08\u672C\u6A5F ${local}\uFF09` : ""}\uFF0C\u5206\u652F ${r.git.branch}`,
         `\u79DF\u7D04\u5230 ${fmtTime(r.lease_expires_at)}\u3002\u73FE\u5728\u5728\u5F8C\u53F0\u8DD1 apm keepalive`
       ].join("\n")
@@ -3655,8 +3713,8 @@ ${why.slice(0, 10).map((x) => `#${x.number}\uFF1A${x.reason}`).join("\n")}` : ""
   },
   async submit(ctx) {
     const w = await ctx.worker();
-    const r = await w.submit({ summary: str(ctx.args.flags, "summary") ?? "", pr_url: str(ctx.args.flags, "pr") });
-    out(r, () => `#${r.task} \u5DF2\u4EA4\u4ED8\uFF0C\u7B49\u5F85 review${r.pr_url ? `\uFF1A${r.pr_url}` : "\uFF08\u6C92\u6709\u627E\u5230 PR\uFF09"}`);
+    const r = await w.submit({ summary: str(ctx.args.flags, "summary") ?? "", pr_url: str(ctx.args.flags, "pr"), open_pr: ctx.args.flags["open-pr"] !== false });
+    out(r, () => `#${r.task} \u5DF2\u4EA4\u4ED8\uFF0C\u7B49\u5F85 review${r.pr_url ? `\uFF1A${r.pr_url}${r.pr_created ? "\uFF08apm \u958B\u7684 PR\uFF09" : ""}` : `\uFF08\u6C92\u6709 PR${r.pr_error ? `\uFF1A${r.pr_error}` : ""}\uFF09`}`);
   },
   async block(ctx) {
     const w = await ctx.worker();
@@ -3859,6 +3917,10 @@ ${r.worklog.map((e) => `  ${fmtTime(e.at)} ${e.worker_id} ${e.kind === "checkpoi
     out(r, () => r.map((c) => `${pad(c.login, 20)}${c.role}`).join("\n"));
   }
 };
+function onPath(dir) {
+  const sep = process.platform === "win32" ? ";" : ":";
+  return (process.env.PATH ?? "").split(sep).some((p) => p && resolve(p) === resolve(dir));
+}
 function applyWorkerFlags(cfg, f) {
   cfg.worker ??= {};
   const id = str(f, "id");
@@ -3887,6 +3949,7 @@ function exitCode(err) {
 async function main(argv = process.argv.slice(2)) {
   const args = parseArgs(argv);
   forceJson = args.flags.json === true;
+  forceText = args.flags.text === true;
   const cmd = args.pos[0] ?? "help";
   if (args.flags.help === true || cmd === "--help") {
     process.stdout.write(HELP + "\n");

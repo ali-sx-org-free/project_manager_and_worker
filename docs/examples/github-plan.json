@@ -1,0 +1,40 @@
+{
+  "key": "handbook",
+  "title": "驗收練習：寫一本團隊手冊",
+  "description": "用來驗收 GitHub hub 方案的練習項目。不寫代碼，只在 hub 倉庫的 handbook/ 目錄裡寫 Markdown，所以不需要另外的代碼倉庫。",
+  "priority": 3,
+  "max_parallel": null,
+  "merge_on_approve": true,
+  "tasks": [
+    {
+      "key": "onboarding",
+      "title": "手冊：新人入職",
+      "caps": ["docs"],
+      "description": "新增 handbook/onboarding.md，寫三節：第一天、第一週、找誰問問題。每寫完一節就 commit、push、存檢查點。",
+      "acceptance": "- 檔案存在，有三個二級標題\n- 每節至少三行"
+    },
+    {
+      "key": "review",
+      "title": "手冊：代碼 review 規範",
+      "caps": ["docs"],
+      "description": "新增 handbook/review.md，寫三節：什麼時候要 review、看什麼、怎麼給意見。",
+      "acceptance": "- 檔案存在，有三個二級標題\n- 每節至少三行"
+    },
+    {
+      "key": "oncall",
+      "title": "手冊：值班",
+      "caps": ["docs"],
+      "description": "新增 handbook/oncall.md，寫三節：值班表、收到告警怎麼辦、交接。",
+      "acceptance": "- 檔案存在，有三個二級標題\n- 每節至少三行"
+    },
+    {
+      "key": "index",
+      "title": "手冊：目錄頁",
+      "caps": ["docs"],
+      "deps": ["onboarding", "review", "oncall"],
+      "description": "新增 handbook/README.md，列出上面三份文件，每份一句話介紹並附相對鏈接。上游三個任務合併以後才能做。",
+      "acceptance": "- 三個鏈接都能打開\n- 每份文件有一句介紹",
+      "human_review": true
+    }
+  ]
+}

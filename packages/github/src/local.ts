@@ -61,6 +61,10 @@ export interface HeldState {
   comment_id: number;
   branch: string;
   code_repo: string;
+  /** PR 的目標分支（null = 代碼倉庫的預設分支） */
+  base?: string | null;
+  pr_title?: string;
+  pr_footer?: string;
   claimed_at: number;
   /** 最後一次有 apm 命令動過這個任務（keepalive 用來判斷 agent 還在不在） */
   last_activity: number;

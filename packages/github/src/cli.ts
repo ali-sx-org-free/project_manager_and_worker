@@ -61,6 +61,7 @@ const BOOL = new Set([
   'link',
   'prs',
   'yes',
+  'open-pr',
 ]);
 
 interface Args {
@@ -198,8 +199,9 @@ function makeCtx(args: Args): Ctx {
 
 // ───────────────────────── 輸出 ─────────────────────────
 
-const tty = () => !!process.stdout.isTTY;
 let forceJson = false;
+let forceText = false;
+const tty = () => forceText || !!process.stdout.isTTY;
 
 function out(data: unknown, text?: () => string) {
   if (text && tty() && !forceJson) process.stdout.write(text() + '\n');
@@ -368,7 +370,7 @@ Worker
   apm keepalive                  在後台跑：定時續約，任務結束或被接手時退出
   apm heartbeat                  手動續約
   apm checkpoint --summary "…" [--next "…"] [--progress 60] [--commit abc123] [--artifact 路徑]
-  apm submit --summary "…" [--pr 網址]
+  apm submit --summary "…" [--pr 網址] [--no-open-pr]   還沒有 PR 時自動用任務分支開一個
   apm block --reason "…"
   apm release [--reason usage_limit|interrupted|released|error] [--note "交接說明"]
   apm current                    手上的任務
@@ -393,7 +395,7 @@ PM
   apm locks [prune [--dry-run]]
   apm invite <帳號> [--permission push]   apm uninvite <帳號>   apm members
 
-通用參數：--hub owner/repo  --worker <id>  --json
+通用參數：--hub owner/repo  --worker <id>  --json（強制 JSON）  --text（強制人看的格式）
 退出碼：0 成功 · 1 出錯 · 2 沒有任務 · 3 租約已不屬於你（立刻停手）`;
 
 type Handler = (ctx: Ctx) => Promise<number | void>;
@@ -435,6 +437,9 @@ const commands: Record<string, Handler> = {
       return [
         `本機設定：${result.config}`,
         l ? `啟動器：${l.bin}${l.linked ? `（也放到了 ${l.linked}）` : ''}` : '',
+        l && !l.linked && !onPath(dirname(l.bin))
+          ? `  在終端裡直接打 apm：把它加進 PATH，例如在 ~/.zshrc 或 ~/.bashrc 加一行 export PATH="${dirname(l.bin)}:$PATH"，或重跑 apm setup --link`
+          : '',
         p ? (p.error ? `權限：${p.error}` : `Claude Code 權限：${p.added.length ? `在 ${p.path} 加上 ${p.added.join('、')}` : '已經有了'}`) : '',
         '',
         checksText(cs),
@@ -477,9 +482,12 @@ const commands: Record<string, Handler> = {
   async join(ctx) {
     const cfg: LocalConfig = { ...ctx.cfg, worker: { ...ctx.cfg.worker } };
     applyWorkerFlags(cfg, ctx.args.flags);
-    if (!cfg.worker!.id) cfg.worker!.id = str(ctx.args.flags, 'worker') || process.env.APM_WORKER_ID || defaultWorkerId();
+    // --worker / APM_WORKER_ID 只管這一次（同一台電腦的第二個 worker），不寫進設定；只有 --id 或第一次的主機名會存下來
+    const transient = str(ctx.args.flags, 'worker') || process.env.APM_WORKER_ID;
+    if (!cfg.worker!.id && !transient) cfg.worker!.id = defaultWorkerId();
     saveConfig(cfg);
-    const w = await makeCtx({ ...ctx.args, flags: { ...ctx.args.flags, worker: cfg.worker!.id! } }).worker();
+    const id = str(ctx.args.flags, 'id') || transient || cfg.worker!.id || defaultWorkerId();
+    const w = await makeCtx({ ...ctx.args, flags: { ...ctx.args.flags, worker: id } }).worker();
     const meta = await w.join();
     out({ worker: meta, config: join(apmHome(), 'config.json') }, () =>
       `已加入 ${w.hub.name}：${meta.id}（${meta.owner}），能力 ${meta.labels.join('、') || '（無）'}${meta.projects?.length ? `，只做 ${meta.projects.join('、')}` : ''}`,
@@ -498,14 +506,20 @@ const commands: Record<string, Handler> = {
       }
     }
     w.state.clear();
+    let dropped = false;
     if (ctx.args.flags.forget === true) {
       await w.forget();
-      const cfg = { ...ctx.cfg };
-      delete cfg.worker;
-      saveConfig(cfg);
+      // 只在離開的是本機設定裡的那個 worker 時才刪設定（用 APM_WORKER_ID 臨時開的第二個 worker 不影響主設定）
+      const mainId = ctx.cfg.worker?.id;
+      dropped = !mainId || mainId === w.me.id;
+      if (dropped) {
+        const cfg = { ...ctx.cfg };
+        delete cfg.worker;
+        saveConfig(cfg);
+      }
     } else await w.updateRoster({ status: 'left', current_task: null });
-    out({ left: w.me.id, released, forgot: ctx.args.flags.forget === true }, () =>
-      `${w.me.id} 已離開${released ? `，交出了 #${released}` : ''}${ctx.args.flags.forget === true ? '，名冊記錄和本機設定已刪除' : ''}`,
+    out({ left: w.me.id, released, forgot: ctx.args.flags.forget === true, config_removed: dropped }, () =>
+      `${w.me.id} 已離開${released ? `，交出了 #${released}` : ''}${ctx.args.flags.forget === true ? `，名冊記錄${dropped ? '和本機的 worker 設定' : ''}已刪除` : ''}`,
     );
   },
 
@@ -545,6 +559,7 @@ const commands: Record<string, Handler> = {
       [
         `領到 #${r.task.number}「${r.task.title}」（${r.task.project}，第 ${r.attempt} 次領取）`,
         r.resume ? `續作：上一位 ${r.resume.from_worker ?? '—'} 做到 ${r.resume.progress}%（${r.resume.reason ?? ''}）\n  ${r.resume.summary}\n  接下來：${r.resume.next_steps ?? '—'}` : '從頭開始',
+        ...(r.reviews.at(-1)?.decision === 'reject' ? [`被退回：${r.reviews.at(-1)!.comment || '（沒有說明）'}（${r.reviews.at(-1)!.reviewer}）`] : []),
         `代碼倉庫 ${r.git.repo}${local ? `（本機 ${local}）` : ''}，分支 ${r.git.branch}`,
         `租約到 ${fmtTime(r.lease_expires_at)}。現在在後台跑 apm keepalive`,
       ].join('\n'),
@@ -650,8 +665,8 @@ const commands: Record<string, Handler> = {
 
   async submit(ctx) {
     const w = await ctx.worker();
-    const r = await w.submit({ summary: str(ctx.args.flags, 'summary') ?? '', pr_url: str(ctx.args.flags, 'pr') });
-    out(r, () => `#${r.task} 已交付，等待 review${r.pr_url ? `：${r.pr_url}` : '（沒有找到 PR）'}`);
+    const r = await w.submit({ summary: str(ctx.args.flags, 'summary') ?? '', pr_url: str(ctx.args.flags, 'pr'), open_pr: ctx.args.flags['open-pr'] !== false });
+    out(r, () => `#${r.task} 已交付，等待 review${r.pr_url ? `：${r.pr_url}${r.pr_created ? '（apm 開的 PR）' : ''}` : `（沒有 PR${r.pr_error ? `：${r.pr_error}` : ''}）`}`);
   },
 
   async block(ctx) {
@@ -867,6 +882,11 @@ const commands: Record<string, Handler> = {
   },
 };
 
+function onPath(dir: string): boolean {
+  const sep = process.platform === 'win32' ? ';' : ':';
+  return (process.env.PATH ?? '').split(sep).some((p) => p && resolve(p) === resolve(dir));
+}
+
 function applyWorkerFlags(cfg: LocalConfig, f: Args['flags']) {
   cfg.worker ??= {};
   const id = str(f, 'id');
@@ -899,6 +919,7 @@ function exitCode(err: unknown): number {
 export async function main(argv = process.argv.slice(2)): Promise<number> {
   const args = parseArgs(argv);
   forceJson = args.flags.json === true;
+  forceText = args.flags.text === true;
   const cmd = args.pos[0] ?? 'help';
   if (args.flags.help === true || cmd === '--help') {
     process.stdout.write(HELP + '\n');

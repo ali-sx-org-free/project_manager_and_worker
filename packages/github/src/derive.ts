@@ -210,6 +210,8 @@ export function replay(entries: Entry[]): Replayed {
         r.last_assignee = m.worker;
         r.progress = 100;
         r.result = { summary: m.summary, pr_url: m.pr_url || undefined, submitted_by: m.worker, submitted_at: e.at };
+        // 交付說明也記進接力記錄：被退回時，接手的人看到的「做到哪了」是這次交付，而不是更早的交接
+        log({ kind: 'checkpoint', worker_id: m.worker, attempt: m.attempt, at: e.at, summary: `交付：${m.summary}`, progress: 100 });
         break;
       }
       case 'blocked': {

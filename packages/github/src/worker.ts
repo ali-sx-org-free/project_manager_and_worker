@@ -321,6 +321,9 @@ export class WorkerOps {
       comment_id: c.id,
       branch,
       code_repo: codeRepo,
+      base: p.base,
+      pr_title: `[${p.key}/${t.key}] ${t.title}`,
+      pr_footer: `Project: ${p.key}\nTask: ${this.hub.name}#${t.number}`,
       claimed_at: now,
       last_activity: Date.now(),
     };
@@ -455,11 +458,20 @@ export class WorkerOps {
     await this.updateRoster({ current_task: null }).catch(() => undefined);
   }
 
-  async submit(r: { summary: string; pr_url?: string }): Promise<{ task: number; pr_url: string | null; url: string }> {
+  async submit(r: { summary: string; pr_url?: string; open_pr?: boolean }): Promise<{ task: number; pr_url: string | null; pr_created: boolean; pr_error?: string; url: string }> {
     if (!r.summary?.trim()) throw new Error('交付需要 --summary：做了什麼、怎麼驗證、對照驗收標準的結果');
     const s = this.requireHeld();
     await this.writeLock(s, 'submitted');
-    const pr = r.pr_url || (await this.findPr(s));
+    let pr = r.pr_url || (await this.findPr(s));
+    let created = false;
+    let prError: string | undefined;
+    if (!pr && r.open_pr !== false) {
+      // 還沒有 PR：用任務分支開一個（不寫代碼的任務沒有分支，開不了就算了）
+      const o = await this.openPr(s, r.summary.trim());
+      pr = o.url;
+      created = !!o.url;
+      prError = o.error;
+    }
     const meta: SubmittedMeta = { kind: 'submitted', attempt: s.attempt, worker: this.me.id, summary: r.summary.trim(), pr_url: pr ?? undefined, at: this.hub.now() };
     await this.hub.comment(
       s.task,
@@ -469,7 +481,23 @@ export class WorkerOps {
     const t = await this.hub.task(s.task);
     await this.hub.setStatus(t, 'in_review');
     await this.finish(s);
-    return { task: s.task, pr_url: pr, url: t.url };
+    return { task: s.task, pr_url: pr, pr_created: created, ...(prError ? { pr_error: prError } : {}), url: t.url };
+  }
+
+  private async openPr(s: HeldState, summary: string): Promise<{ url: string | null; error?: string }> {
+    try {
+      const base = s.base || (await this.hub.gh.get<{ default_branch: string }>(`/repos/${s.code_repo}`)).default_branch;
+      const pr = await this.hub.gh.post<{ html_url: string }>(`/repos/${s.code_repo}/pulls`, {
+        title: s.pr_title ?? `[${s.project_key}] ${s.title}`,
+        head: s.branch,
+        base,
+        body: `${summary}\n\n${s.pr_footer ?? `Task: ${this.hub.name}#${s.task}`}`,
+      });
+      return { url: pr.html_url };
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      return { url: null, error: /No commits between|head|not found|Validation Failed/i.test(msg) ? `分支 ${s.branch} 在 ${s.code_repo} 上沒有新的 commit，沒有開 PR` : msg };
+    }
   }
 
   async block(reason: string): Promise<{ task: number }> {

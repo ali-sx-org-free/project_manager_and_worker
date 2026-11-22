@@ -161,6 +161,10 @@ test('完整流程：領取 → 檢查點 → 交出 → 別人續作 → 交付
   assert.equal(c3.attempt, 3);
   assert.equal(c3.reviews.length, 1);
   assert.equal(c3.reviews[0].decision, 'reject');
+  // 續作資訊指向這次交付，而不是更早 alice 的交接
+  assert.equal(c3.resume!.reason, 'changes_requested');
+  assert.equal(c3.resume!.handoff_note, null);
+  assert.match(c3.resume!.summary, /完成 API/);
   await bob.submit({ summary: '改成 401', pr_url: prUrl });
 
   const ok = await pm.review(api.number, 'approve', '很好');
@@ -391,4 +395,28 @@ test('名冊：join 登記、id 不能被別人的帳號佔用、leave', async (
   assert.equal(ws[0].status, 'offline');
   await a.forget();
   assert.equal([...gh.repo(hubName).comments.values()].filter((c) => c.body.includes('"kind":"worker"')).length, 0);
+});
+
+test('交付時還沒有 PR：apm 用任務分支自動開一個；分支沒推上去就不開', async () => {
+  const { pm, gh, hubName, worker } = world();
+  await pm.init();
+  const { tasks } = await pm.createProject(plan({ base: 'main', tasks: [{ key: 'a', title: 'A' }, { key: 'b', title: 'B' }] }));
+  const alice = worker('alice', 'alice-pc');
+  const c = (await alice.claim(tasks[0].number))!;
+  gh.pushBranch(hubName, c.git.branch);
+  const s = await alice.submit({ summary: '完成' });
+  assert.equal(s.pr_created, true);
+  assert.match(s.pr_url!, /\/pull\/\d+$/);
+  const pr = gh.pull(hubName, Number(s.pr_url!.split('/').pop()))!;
+  assert.equal(pr.head, c.git.branch);
+  assert.equal(pr.base, 'main');
+  assert.equal(pr.title, c.git.pr_title);
+  const r = await pm.review(tasks[0].number, 'approve');
+  assert.equal(r.merged, true);
+
+  const c2 = (await alice.claim(tasks[1].number))!;
+  const s2 = await alice.submit({ summary: '不寫代碼的任務' });
+  assert.equal(s2.pr_url, null);
+  assert.match(s2.pr_error!, /沒有新的 commit/);
+  void c2;
 });
