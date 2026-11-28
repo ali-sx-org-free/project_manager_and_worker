@@ -79,12 +79,14 @@ export function stringifyYamlish(data: Block): string {
 
 // ───────────────────────── Issue 正文裡的區塊 ─────────────────────────
 
-const blockRe = (tag: string) => new RegExp(`\\n*<!--\\s*${tag.replace(/[:]/g, '\\:')}\\s*\\n([\\s\\S]*?)-->\\s*$`);
+const blockRe = (tag: string) => new RegExp(`\\n*<!--\\s*${tag.replace(/[:]/g, '\\:')}\\s*\\n((?:(?!<!--)[\\s\\S])*?)-->`, 'g'); // 內容裡不能再有 <!--：說明裡引用了半個區塊時，不會從那裡一路吃到真正的區塊
 
-/** 從 Issue 正文讀出 `<!-- apm:task … -->` 區塊；rest 是去掉區塊後給人看的部分 */
+/** 從 Issue 正文讀出 `<!-- apm:task … -->` 區塊；rest 是區塊之前給人看的部分。
+ *  區塊後面可以有別的文字（例如有些環境寫 Issue 時自動在正文最後加的頁腳），讀的時候忽略，
+ *  也不放進 rest，所以 apm 下次寫回正文時會把它去掉。正文裡有好幾個區塊（例如說明裡引用了一段）時，取最後一個。 */
 export function readBodyBlock(body: string | null | undefined, tag: string): { data: Block | null; rest: string } {
   const text = body ?? '';
-  const m = text.match(blockRe(tag));
+  const m = [...text.matchAll(blockRe(tag))].at(-1);
   if (!m) return { data: null, rest: text.trim() };
   return { data: parseYamlish(m[1]), rest: text.slice(0, m.index).trim() };
 }

@@ -73,6 +73,8 @@ export class FakeGitHub {
   /** 每個請求記一筆（測試用來數寫入次數） */
   log: { method: string; path: string; user: string | null }[] = [];
   clock: number;
+  /** 模擬有些環境（例如 Claude Code 雲端會話）寫 Issue、留言、PR 時自動在正文最後加的頁腳 */
+  footer: string | null = null;
   /** 測試用：讓某個請求失敗 */
   failNext: ((method: string, path: string) => { status: number; message: string } | null) | null = null;
 
@@ -81,6 +83,10 @@ export class FakeGitHub {
   }
 
   now = () => this.clock;
+
+  private withFooter(text: string): string {
+    return this.footer ? `${text}${this.footer}` : text;
+  }
   advance(ms: number) {
     this.clock += ms;
   }
@@ -283,7 +289,7 @@ export class FakeGitHub {
       if (method === 'GET') return reply(200, this.commentJson(r, c));
       if (c.user !== user && !canWrite) return reply(403, { message: 'Resource not accessible' });
       if (method === 'PATCH') {
-        c.body = String(body.body);
+        c.body = this.withFooter(String(body.body));
         c.updated_at = now;
         return reply(200, this.commentJson(r, c));
       }
@@ -315,7 +321,7 @@ export class FakeGitHub {
           id: ++this.seq,
           number,
           title: String(body.title),
-          body: String(body.body ?? ''),
+          body: this.withFooter(String(body.body ?? '')),
           state: 'open',
           state_reason: null,
           labels,
@@ -342,7 +348,7 @@ export class FakeGitHub {
         if (method === 'PATCH') {
           if (!canTriage) return reply(403, { message: 'Resource not accessible' });
           if (body.title !== undefined) i.title = String(body.title);
-          if (body.body !== undefined) i.body = String(body.body);
+          if (body.body !== undefined) i.body = this.withFooter(String(body.body));
           if (body.labels !== undefined) {
             i.labels = (body.labels as string[]).map(String);
             for (const l of i.labels) if (!r.labels.has(l)) r.labels.set(l, 'ededed');
@@ -367,7 +373,7 @@ export class FakeGitHub {
           return reply(200, page(list.map((c) => this.commentJson(r, c))));
         }
         if (method === 'POST') {
-          const c: FComment = { id: ++this.commentSeq, issue: n, body: String(body.body), user, created_at: now, updated_at: now };
+          const c: FComment = { id: ++this.commentSeq, issue: n, body: this.withFooter(String(body.body)), user, created_at: now, updated_at: now };
           r.comments.set(c.id, c);
           if (i) i.updated_at = now;
           return reply(201, this.commentJson(r, c));
