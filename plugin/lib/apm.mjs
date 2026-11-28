@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// apm 0.2.0 · agent-pm 命令行（由 scripts/build-apm.mjs 從 packages/github 打包，不要手改）
+// apm 0.2.1 · agent-pm 命令行（由 scripts/build-apm.mjs 從 packages/github 打包，不要手改）
 
 // packages/github/src/cli.ts
 import { spawnSync } from "node:child_process";
@@ -554,10 +554,10 @@ function fmtScalar(v) {
 function stringifyYamlish(data) {
   return Object.entries(data).filter(([, v]) => v !== void 0).map(([k, v]) => `${k}: ${Array.isArray(v) ? `[${v.map(fmtScalar).join(", ")}]` : fmtScalar(v)}`).join("\n");
 }
-var blockRe = (tag) => new RegExp(`\\n*<!--\\s*${tag.replace(/[:]/g, "\\:")}\\s*\\n([\\s\\S]*?)-->\\s*$`);
+var blockRe = (tag) => new RegExp(`\\n*<!--\\s*${tag.replace(/[:]/g, "\\:")}\\s*\\n((?:(?!<!--)[\\s\\S])*?)-->`, "g");
 function readBodyBlock(body, tag) {
   const text = body ?? "";
-  const m = text.match(blockRe(tag));
+  const m = [...text.matchAll(blockRe(tag))].at(-1);
   if (!m) return { data: null, rest: text.trim() };
   return { data: parseYamlish(m[1]), rest: text.slice(0, m.index).trim() };
 }
@@ -2652,12 +2652,17 @@ var FakeGitHub = class {
   /** 每個請求記一筆（測試用來數寫入次數） */
   log = [];
   clock;
+  /** 模擬有些環境（例如 Claude Code 雲端會話）寫 Issue、留言、PR 時自動在正文最後加的頁腳 */
+  footer = null;
   /** 測試用：讓某個請求失敗 */
   failNext = null;
   constructor(start = Date.parse("2026-11-22T00:00:00Z")) {
     this.clock = start;
   }
   now = () => this.clock;
+  withFooter(text) {
+    return this.footer ? `${text}${this.footer}` : text;
+  }
   advance(ms) {
     this.clock += ms;
   }
@@ -2838,7 +2843,7 @@ var FakeGitHub = class {
       if (method === "GET") return reply(200, this.commentJson(r, c));
       if (c.user !== user && !canWrite) return reply(403, { message: "Resource not accessible" });
       if (method === "PATCH") {
-        c.body = String(body.body);
+        c.body = this.withFooter(String(body.body));
         c.updated_at = now;
         return reply(200, this.commentJson(r, c));
       }
@@ -2864,7 +2869,7 @@ var FakeGitHub = class {
           id: ++this.seq,
           number,
           title: String(body.title),
-          body: String(body.body ?? ""),
+          body: this.withFooter(String(body.body ?? "")),
           state: "open",
           state_reason: null,
           labels,
@@ -2891,7 +2896,7 @@ var FakeGitHub = class {
         if (method === "PATCH") {
           if (!canTriage) return reply(403, { message: "Resource not accessible" });
           if (body.title !== void 0) i.title = String(body.title);
-          if (body.body !== void 0) i.body = String(body.body);
+          if (body.body !== void 0) i.body = this.withFooter(String(body.body));
           if (body.labels !== void 0) {
             i.labels = body.labels.map(String);
             for (const l of i.labels) if (!r.labels.has(l)) r.labels.set(l, "ededed");
@@ -2916,7 +2921,7 @@ var FakeGitHub = class {
           return reply(200, page(list2.map((c) => this.commentJson(r, c))));
         }
         if (method === "POST") {
-          const c = { id: ++this.commentSeq, issue: n, body: String(body.body), user, created_at: now, updated_at: now };
+          const c = { id: ++this.commentSeq, issue: n, body: this.withFooter(String(body.body)), user, created_at: now, updated_at: now };
           r.comments.set(c.id, c);
           if (i) i.updated_at = now;
           return reply(201, this.commentJson(r, c));
@@ -3132,7 +3137,7 @@ async function selftest() {
 }
 
 // packages/github/src/cli.ts
-var VERSION = "0.2.0";
+var VERSION = "0.2.1";
 if ((process.env.HTTPS_PROXY || process.env.https_proxy) && !process.env.NODE_USE_ENV_PROXY && !process.env.APM_NO_REEXEC && Number(process.versions.node.split(".")[0]) >= 22) {
   const r = spawnSync(process.execPath, [...process.execArgv, ...process.argv.slice(1)], {
     stdio: "inherit",
@@ -3307,6 +3312,7 @@ function installLauncher(link) {
   const me = selfPath();
   let cmd;
   let mode = "bundle";
+  let fromCopy = false;
   if (me.endsWith(".ts")) {
     mode = "dev";
     const root = resolve(dirname3(me), "../../..");
@@ -3314,8 +3320,10 @@ function installLauncher(link) {
   } else {
     const lib = join4(home, "lib");
     mkdirSync3(lib, { recursive: true });
-    copyFileSync(me, join4(lib, "apm.mjs"));
-    cmd = `node "${join4(lib, "apm.mjs")}"`;
+    const copy = join4(lib, "apm.mjs");
+    if (resolve(me) === resolve(copy)) fromCopy = true;
+    else copyFileSync(me, copy);
+    cmd = `node "${copy}"`;
   }
   const sh = join4(binDir, "apm");
   writeFileSync2(sh, `#!/bin/sh
@@ -3337,7 +3345,7 @@ exec "${sh}" "$@"
     chmodSync(target, 493);
     linked = target;
   }
-  return { bin: sh, linked, mode };
+  return { bin: sh, linked, mode, ...fromCopy ? { from_installed_copy: true } : {} };
 }
 var RULES = (bin) => ["Bash(apm *)", "Bash(apm:*)", `Bash(${bin} *)`];
 function claudeSettingsPath() {
@@ -3492,6 +3500,7 @@ ${r.ok ? "\u5168\u90E8\u901A\u904E" : "\u6709\u5931\u6557"}`);
       return [
         `\u672C\u6A5F\u8A2D\u5B9A\uFF1A${result.config}`,
         l ? `\u555F\u52D5\u5668\uFF1A${l.bin}${l.linked ? `\uFF08\u4E5F\u653E\u5230\u4E86 ${l.linked}\uFF09` : ""}` : "",
+        l?.from_installed_copy ? `  \u73FE\u5728\u8DD1\u7684\u5C31\u662F\u5DF2\u5B89\u88DD\u7684 apm ${VERSION}\uFF0C\u6C92\u6709\u66F4\u65B0\u3002\u8981\u66F4\u65B0\uFF1A\u5148\u62FF\u5230\u65B0\u7248\uFF08git pull\uFF09\uFF0C\u518D\u7528\u65B0\u7248\u7684\u6A94\u6848\u8DD1 setup\uFF0C\u4F8B\u5982 node ~/agent-pm-tools/plugin/lib/apm.mjs setup --hub <\u5009\u5EAB>` : "",
         l && !l.linked && !onPath(dirname3(l.bin)) ? `  \u5728\u7D42\u7AEF\u88E1\u76F4\u63A5\u6253 apm\uFF1A\u628A\u5B83\u52A0\u9032 PATH\uFF0C\u4F8B\u5982\u5728 ~/.zshrc \u6216 ~/.bashrc \u52A0\u4E00\u884C export PATH="${dirname3(l.bin)}:$PATH"\uFF0C\u6216\u91CD\u8DD1 apm setup --link` : "",
         p ? p.error ? `\u6B0A\u9650\uFF1A${p.error}` : `Claude Code \u6B0A\u9650\uFF1A${p.added.length ? `\u5728 ${p.path} \u52A0\u4E0A ${p.added.join("\u3001")}` : "\u5DF2\u7D93\u6709\u4E86"}` : "",
         "",

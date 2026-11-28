@@ -55,7 +55,7 @@ apm selftest --text
 
 **應該看到**
 
-- `npm test` 跑四個包，每個包最後都是 `# fail 0`（core 18 個、server 6 個、github 21 個、console 2 個）。
+- `npm test` 跑四個包，每個包最後都是 `# fail 0`（core 18 個、server 6 個、github 27 個、console 2 個）。
 - `apm selftest` 的最後幾行：
 
   ```

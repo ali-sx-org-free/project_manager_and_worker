@@ -58,6 +58,22 @@ apm doctor
 
 `plugin/lib/apm.mjs` 是打包好的單檔，不需要 `npm install`。從源碼重新打包：`npm run build:apm`。
 
+**更新 apm**（`apm version` 看現在的版本）：
+
+```bash
+# clone 下來用的（例如放在 ~/agent-pm-tools）
+git -C ~/agent-pm-tools pull
+node ~/agent-pm-tools/plugin/lib/apm.mjs setup     # 用新版的檔案跑 setup，設定沿用原來的
+apm version
+
+# Claude Code 插件用的（更新後重開 Claude Code）
+claude plugin marketplace update agent-pm
+claude plugin update agent-pm@agent-pm
+```
+
+`~/.agent-pm/bin/apm` 啟動器跑的是 setup 時複製到 `~/.agent-pm/lib/apm.mjs` 的副本，所以只 `git pull` 不會生效，
+直接打 `apm setup` 也不會（跑的還是舊副本，apm 會提示）。插件用戶如果也跑過 `apm setup`，同樣要用新版的檔案再跑一次。
+
 ## 管理員：建 hub
 
 ```bash

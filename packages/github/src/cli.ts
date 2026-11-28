@@ -17,7 +17,7 @@ import { PmOps, type Plan, type PlanTask } from './pm.ts';
 import { LeaseLost, NothingHeld, WorkerOps, type WorkerIdentity } from './worker.ts';
 import { selftest } from './selftest.ts';
 
-export const VERSION = '0.2.0';
+export const VERSION = '0.2.1';
 
 // ───────────────────────── 走代理的環境 ─────────────────────────
 
@@ -230,13 +230,14 @@ function selfPath(): string {
   return resolve(process.argv[1]);
 }
 
-function installLauncher(link: boolean): { bin: string; linked: string | null; mode: 'bundle' | 'dev' } {
+function installLauncher(link: boolean): { bin: string; linked: string | null; mode: 'bundle' | 'dev'; from_installed_copy?: boolean } {
   const home = apmHome();
   const binDir = join(home, 'bin');
   mkdirSync(binDir, { recursive: true });
   const me = selfPath();
   let cmd: string;
   let mode: 'bundle' | 'dev' = 'bundle';
+  let fromCopy = false;
   if (me.endsWith('.ts')) {
     // 開發模式：從原型倉庫用 tsx 跑
     mode = 'dev';
@@ -245,8 +246,11 @@ function installLauncher(link: boolean): { bin: string; linked: string | null; m
   } else {
     const lib = join(home, 'lib');
     mkdirSync(lib, { recursive: true });
-    copyFileSync(me, join(lib, 'apm.mjs'));
-    cmd = `node "${join(lib, 'apm.mjs')}"`;
+    const copy = join(lib, 'apm.mjs');
+    // 用啟動器跑 apm setup 時，跑的就是這份副本：複製不會更新任何東西
+    if (resolve(me) === resolve(copy)) fromCopy = true;
+    else copyFileSync(me, copy);
+    cmd = `node "${copy}"`;
   }
   const sh = join(binDir, 'apm');
   writeFileSync(sh, `#!/bin/sh\n# agent-pm 的 apm 啟動器（apm setup 生成）\nexec ${cmd} "$@"\n`);
@@ -261,7 +265,7 @@ function installLauncher(link: boolean): { bin: string; linked: string | null; m
     chmodSync(target, 0o755);
     linked = target;
   }
-  return { bin: sh, linked, mode };
+  return { bin: sh, linked, mode, ...(fromCopy ? { from_installed_copy: true } : {}) };
 }
 
 const RULES = (bin: string) => ['Bash(apm *)', 'Bash(apm:*)', `Bash(${bin} *)`];
@@ -437,6 +441,9 @@ const commands: Record<string, Handler> = {
       return [
         `本機設定：${result.config}`,
         l ? `啟動器：${l.bin}${l.linked ? `（也放到了 ${l.linked}）` : ''}` : '',
+        l?.from_installed_copy
+          ? `  現在跑的就是已安裝的 apm ${VERSION}，沒有更新。要更新：先拿到新版（git pull），再用新版的檔案跑 setup，例如 node ~/agent-pm-tools/plugin/lib/apm.mjs setup --hub <倉庫>`
+          : '',
         l && !l.linked && !onPath(dirname(l.bin))
           ? `  在終端裡直接打 apm：把它加進 PATH，例如在 ~/.zshrc 或 ~/.bashrc 加一行 export PATH="${dirname(l.bin)}:$PATH"，或重跑 apm setup --link`
           : '',
