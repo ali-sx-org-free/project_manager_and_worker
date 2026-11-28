@@ -760,5 +760,28 @@ export function deriveEvents(model: HubModel, snapshot: HubSnapshot, workerNames
   }
 
   out.sort((a, b) => a.ts - b.ts || a.key.localeCompare(b.key));
+
+  // 回放不能沿用當前名冊的 current_task（任務完成後已經是 null）。
+  // 按時間重建 worker 的工作位置；舊任務的 review 不能清掉它正在做的新任務。
+  const workers = new Map(snapshot.workers.map((w) => [w.id, { ...w, current_task: null } as Worker]));
+  for (const e of out) {
+    const task = e.task;
+    if (!task) continue;
+    const id = task.state === 'claimed' ? task.assignee : task.last_assignee;
+    if (!id) continue;
+    const previous = workers.get(id) ?? {
+      id, name: name(id), machine: '', labels: [], owner: null, projects: null,
+      status: 'offline', current_task: null, last_seen: 0, registered_at: e.ts,
+    } satisfies Worker;
+    if (task.state !== 'claimed' && previous.current_task !== task.id) continue;
+    const worker: Worker = {
+      ...previous,
+      status: e.type === 'lease_expired' ? 'offline' : 'online',
+      current_task: task.state === 'claimed' ? task.id : null,
+      last_seen: e.type === 'lease_expired' ? previous.last_seen : e.ts,
+    };
+    workers.set(id, worker);
+    e.worker = worker;
+  }
   return out.map((e, i) => ({ ...e, id: i + 1 }));
 }
